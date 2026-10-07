@@ -1,0 +1,110 @@
+@page "/offers"
+@using System.Text.Json
+@using JobFinder.Core.Filtering
+@using JobFinder.Llm.Tasks
+@using JobFinder.Pipeline.Market
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject OfferAdvisor Advisor
+@inject MarketService Market
+
+<PageTitle>JobFinder · Офферы</PageTitle>
+<h1>Офферы</h1>
+<Flash Message="@_flash" Error="@_error"/>
+
+<div class="panel">
+    <b>Разобрать оффер</b>
+    <p class="muted small">Вставьте текст оффера или условия своими словами: сумма, валюта, gross/net, оформление, испытательный срок, бонусы, формат.
+        Получите сравнение с рынком и другими офферами, риски, вопросы до подписания, цель и нижнюю границу, текст контрпредложения.
+        То же в боте: /offer.</p>
+    <textarea @bind="_text" placeholder="Например: 4200 USD gross, ИП, испытательный 3 месяца, гибрид 2 дня в офисе, ДМС после испытательного…"></textarea>
+    <div class="toolbar" style="margin-top:8px">
+        <button class="primary" disabled="@(_busy || string.IsNullOrWhiteSpace(_text))" @onclick="Analyze">@(_busy ? "Разбираю…" : "🏆 Разобрать")</button>
+    </div>
+    @if (_result is not null) { <div class="panel tg" style="margin-top:12px">@((MarkupString)_result)</div> }
+</div>
+
+@if (_offers.Count > 0)
+{
+    <h2>Сравнение</h2>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Когда</th><th>Компания</th><th class="num">Сумма</th><th class="num">≈ net USD</th><th class="num">Рынок</th><th>Вердикт</th></tr></thead>
+            <tbody>
+            @foreach (var o in _offers.OrderByDescending(o => o.MonthlyNetUsd))
+            {
+                var a = Analysis(o);
+                <tr>
+                    <td class="small">@Ui.Local(o.CreatedAt, "dd.MM.yyyy")</td>
+                    <td>@o.Company @if (o.ApplicationId is not null) { <span class="small muted">· связан с откликом</span> }</td>
+                    <td class="num">@o.MonthlyAmount?.ToString("#,0", CultureInfo.GetCultureInfo("ru-RU")) @o.Currency @(o.Gross == true ? "gross" : o.Gross == false ? "net" : "")</td>
+                    <td class="num">@(o.MonthlyNetUsd is { } usd ? MarketSnapshot.Money(usd) : "—")</td>
+                    <td class="num">@(o.MonthlyNetUsd is { } n && _segment is not null ? $"p{_segment.PercentileOf(n)}" : "—")</td>
+                    <td class="small">@a?.Verdict</td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+    <p class="small muted">Рынок: @(_segment is null ? "мало данных" : MarketSnapshot.SegmentLabel(_segment) + $", медиана {MarketSnapshot.Money(_segment.P50)}, p75 {MarketSnapshot.Money(_segment.P75)}, p90 {MarketSnapshot.Money(_segment.P90)}")</p>
+
+    @foreach (var o in _offers)
+    {
+        var a = Analysis(o);
+        if (a is null) continue;
+        <details class="panel">
+            <summary><b>@o.Company</b> · @Ui.Local(o.CreatedAt, "dd.MM.yyyy")</summary>
+            @if (a.Terms.Count > 0) { <ul class="tight">@foreach (var t in a.Terms) { <li><b>@t.Name:</b> @t.Value</li> }</ul> }
+            @if (a.Risks.Count > 0) { <div>⚠️ Риски<ul class="tight">@foreach (var r in a.Risks) { <li>@r</li> }</ul></div> }
+            @if (a.QuestionsToClarify.Count > 0) { <div>❓ Уточнить<ul class="tight">@foreach (var q in a.QuestionsToClarify) { <li>@q</li> }</ul></div> }
+            <p><b>Цель:</b> @a.CounterTarget · <b>Нижняя граница:</b> @a.WalkAway</p>
+            <div class="pre small panel">@a.CounterScript</div>
+            <details><summary class="small muted">Исходный текст</summary><div class="pre small">@o.RawText</div></details>
+        </details>
+    }
+}
+
+@code {
+    private List<Offer> _offers = [];
+    private SegmentStats? _segment;
+    private string? _text;
+    private string? _result;
+    private string? _flash;
+    private bool _error;
+    private bool _busy;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        _offers = await ctx.Offers.AsNoTracking().OrderByDescending(o => o.CreatedAt).Take(50).ToListAsync();
+        _segment = (await Market.SnapshotAsync(CancellationToken.None)).Lookup("senior+", "*");
+    }
+
+    private static OfferAnalysis? Analysis(Offer o) =>
+        o.AnalysisJson is null ? null : JsonSerializer.Deserialize(o.AnalysisJson, CareerJsonContext.Default.OfferAnalysis);
+
+    private async Task Analyze()
+    {
+        _busy = true;
+        try
+        {
+            var reply = await Advisor.AnalyzeAsync(_text!, CancellationToken.None);
+            _result = reply.Text;
+            _flash = null;
+            _error = false;
+            _text = null;
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        await LoadAsync();
+    }
+}

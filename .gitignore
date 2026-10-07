@@ -1,0 +1,22 @@
+bin/
+obj/
+publish/
+.vs/
+.idea/
+*.user
+.DS_Store
+
+# Local configs with real secrets: never commit
+config/appsettings.Development.json
+config/appsettings.Local.json
+*.local.json
+.env
+
+# Personal data: resume, generated profile
+profile/*
+!profile/.gitkeep
+!profile/profile.example.json
+
+# Runtime state: Telegram session, browser sessions, screenshots, logs
+data/*
+!data/.gitkeep

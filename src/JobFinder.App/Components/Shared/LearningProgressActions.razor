@@ -1,0 +1,31 @@
+@if (Editor?.Draft is not null)
+{
+    <div class="flash bad" role="alert">
+        <p>@Editor.Message</p>
+        <p>Запрошено: @Requested</p>
+        <button disabled="@Editor.Busy" @onclick="Reload">Явно обновить прогресс</button>
+        @if (!Editor.Conflict)
+        {
+            <button disabled="@Editor.Busy" @onclick="Retry">Применить сохранённое изменение</button>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public LearningProgressEditor? Editor { get; set; }
+    [Parameter] public EventCallback OnChanged { get; set; }
+    private string Requested => Editor?.Draft is not { } draft ? "" : draft.Reset is not null ? "сброс прогресса"
+        : draft.Item!.Key + " → " + (draft.State ?? (draft.Approved == true ? "проверено" : "снять проверку"));
+    private async Task Reload()
+    {
+        if (Editor is null) return;
+        await Editor.ReloadAsync(CancellationToken.None);
+        await OnChanged.InvokeAsync();
+    }
+    private async Task Retry()
+    {
+        if (Editor is null) return;
+        await Editor.RetryAsync(CancellationToken.None);
+        await OnChanged.InvokeAsync();
+    }
+}

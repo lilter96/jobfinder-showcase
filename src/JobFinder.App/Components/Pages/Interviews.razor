@@ -1,0 +1,157 @@
+@page "/interviews"
+@using JobFinder.Llm.Tasks
+@using JobFinder.Pipeline.Modules.Preparation
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject InterviewSources Sources
+@inject InterviewProgress Progress
+@inject JobFinder.Core.Time.LocalClock Clock
+
+<PageTitle>JobFinder · Интервью</PageTitle>
+<h1>Интервью</h1>
+<Flash Message="@_flash" Error="@_error"/>
+@if (_error) { <button disabled="@_busy" @onclick="ReloadAsync">Обновить данные (сбросить несохранённые правки)</button> }
+<p class="muted small">
+    Интервью появляется, когда отклик переходит в стадию HR/тех/финал (кнопка в боте, приглашение в ответе, статус hh). Подготовка собирается сама:
+    что спросят, с чего начать ответ, речь на 15, 30 и 60 секунд с вашими реальными кейсами, куда копнут дальше. За час до начала бот пришлёт
+    экран «за 10 минут», после спросит, как прошло.
+</p>
+
+@if (_items.Count == 0)
+{
+    <div class="panel muted">Интервью пока нет.</div>
+}
+
+@foreach (var i in _items)
+{
+    var v = i.Application!.Vacancy!;
+    var c = InterviewPrep.Read(i.PackJson);
+    var ready = c is { Version: InterviewCopilot.CurrentVersion };
+    <div class="panel">
+        <div class="toolbar" style="margin:0">
+            <b>@CareerCards.InterviewLabel(i.Kind)</b>
+            <span>· <a href="vacancies/@v.Id">@v.CompanyName — @v.Title</a></span>
+            <span class="badge @(i.Status == InterviewStatus.Scheduled ? "warn" : i.Status == InterviewStatus.Done ? "good" : "")">@Status(i.Status)</span>
+            <span style="flex:1"></span>
+            @if (ready) { <a class="btn primary-link" href="interviews/@i.Id">🎯 Подготовка</a> }
+            @if (i.PackPdfPath is not null && ready) { <a class="btn" href="files/pack/@i.Id" target="_blank">📄 PDF</a> }
+            <button disabled="@_busy" @onclick="() => Rebuild(i.Id)">🔄 @(i.PackJson is null ? "Собрать подготовку" : "Пересобрать")</button>
+        </div>
+        @if (ready)
+        {
+            var known = _progress.GetValueOrDefault(i.Id)?.Count(kv => kv.Value == InterviewProgress.Known) ?? 0;
+            <div class="small" style="margin-top:8px">
+                Риск: <span class="badge @CopilotRules.Css(c!.OverallRisk)">@CopilotRules.Label(c.OverallRisk)</span>
+                · выучено @known из @c.Preparation.Count
+                · проверить: @c.Preparation.Count(p => p.RequiresApproval)
+                @if (c.Priorities.Count > 0) { <span class="muted"> · важно: @string.Join(", ", c.Priorities.Take(4).Select(p => p.Topic))</span> }
+            </div>
+        }
+        else if (i.PackJson is not null)
+        {
+            <div class="small muted" style="margin-top:8px">Подготовка старого формата (исследование): нажмите «Пересобрать», чтобы получить речь и заучивание.</div>
+        }
+        else if (i.Status == InterviewStatus.Scheduled)
+        {
+            <div class="small muted" style="margin-top:8px">Подготовка собирается: модель думает над каждым вопросом, это несколько минут.</div>
+        }
+        <div class="toolbar" style="margin-top:10px">
+            <label class="small muted">Когда (Минск)</label>
+            <input type="datetime-local" @bind="_times[i.Id]"/>
+            <input type="number" min="15" max="480" step="15" style="width:80px" @bind="_durations[i.Id]"/> <span class="small muted">мин</span>
+            <select @bind="_kinds[i.Id]">
+                @foreach (var k in Enum.GetValues<InterviewKind>()) { <option value="@k">@CareerCards.InterviewLabel(k)</option> }
+            </select>
+            <button disabled="@_busy" @onclick="() => Save(i.Id)">Сохранить</button>
+            @if (i.Status == InterviewStatus.Scheduled)
+            {
+                <button disabled="@_busy" @onclick="() => SetStatus(i.Id, InterviewStatus.Done)">✅ Прошло</button>
+                <button class="danger" disabled="@_busy" @onclick="() => SetStatus(i.Id, InterviewStatus.Cancelled)">Отменено</button>
+            }
+        </div>
+        @if (i.Debrief is not null)
+        {
+            <div style="margin-top:8px"><b>Дебриф</b><div class="pre small">@i.Debrief</div></div>
+        }
+    </div>
+}
+
+@code {
+    private List<Interview> _items = [];
+    private Dictionary<long, Dictionary<string, string>> _progress = [];
+    private Dictionary<long, DateTime?> _times = [];
+    private Dictionary<long, int> _durations = [];
+    private Dictionary<long, InterviewKind> _kinds = [];
+    private Dictionary<long, InterviewEditSnapshot> _snapshots = [];
+    private string? _flash;
+    private bool _error;
+    private bool _busy;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        _items = await ctx.Interviews.AsNoTracking().Include(i => i.Application).ThenInclude(a => a!.Vacancy)
+            .OrderBy(i => i.Status).ThenByDescending(i => i.ScheduledAt ?? i.CreatedAt).Take(100).ToListAsync();
+        _times = _items.ToDictionary(i => i.Id, i => i.ScheduledAt is { } at ? TimeZoneInfo.ConvertTime(at, Clock.Zone).DateTime : (DateTime?)null);
+        _durations = _items.ToDictionary(i => i.Id, i => i.DurationMinutes);
+        _kinds = _items.ToDictionary(i => i.Id, i => i.Kind);
+        _snapshots = _items.ToDictionary(i => i.Id, InterviewEditSnapshot.Capture);
+        _progress = [];
+        foreach (var i in _items) _progress[i.Id] = await Progress.GetAsync(i.Id, CancellationToken.None);
+    }
+
+    private static string Status(InterviewStatus s) => s switch
+    {
+        InterviewStatus.Scheduled => "запланировано",
+        InterviewStatus.Done => "прошло",
+        _ => "отменено",
+    };
+
+    private async Task ReloadAsync()
+    {
+        await LoadAsync();
+        _error = false;
+        _flash = "Данные обновлены";
+    }
+
+    private async Task Save(long id)
+    {
+        await Act(async ct =>
+        {
+            DateTimeOffset? at = null;
+            if (_times[id] is { } local)
+            {
+                var unspecified = DateTime.SpecifyKind(local, DateTimeKind.Unspecified);
+                at = new DateTimeOffset(unspecified, Clock.Zone.GetUtcOffset(unspecified));
+            }
+            return await Sources.EditAsync(_snapshots[id], _kinds[id], _durations[id], at, ct);
+        });
+    }
+
+    private Task SetStatus(long id, InterviewStatus status) => Act(ct => Sources.SetStatusAsync(_snapshots[id], status, ct));
+
+    private Task Rebuild(long id) => Act(ct => Sources.RebuildAsync(_snapshots[id], ct));
+
+    private async Task Act(Func<CancellationToken, Task<ActionResult>> action)
+    {
+        _busy = true;
+        try
+        {
+            var result = await action(CancellationToken.None);
+            _flash = result.Message;
+            _error = !result.Ok;
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        if (!_error) await LoadAsync();
+    }
+}

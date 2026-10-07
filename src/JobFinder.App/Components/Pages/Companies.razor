@@ -1,0 +1,184 @@
+@page "/companies"
+@using JobFinder.Pipeline.Modules.Discovery
+@using JobFinder.Core.Logging
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject CompanyPreferences Preferences
+@inject ILogger<Companies> Log
+
+<PageTitle>JobFinder · Компании</PageTitle>
+<h1>Компании с .NET-вакансиями</h1>
+<p class="muted small">Собираются ночью с hh.ru / rabota.by (джоб <span class="mono">companies</span>). Теги — ключевые слова из HeadHunter:Companies:Tags в описании и отраслях.</p>
+
+<div class="toolbar">
+    <input placeholder="Название, отрасль, описание" @bind="_search" @bind:event="oninput" @bind:after="LoadAsync" style="min-width:260px"/>
+    <select @bind="_tag" @bind:after="LoadAsync">
+        <option value="">Все теги</option>
+        @foreach (var t in _tags)
+        {
+            <option value="@t">@t</option>
+        }
+    </select>
+    <label class="small"><input type="checkbox" @bind="_openOnly" @bind:after="LoadAsync"/> только с открытыми .NET</label>
+    <label class="small"><input type="checkbox" @bind="_watchOnly" @bind:after="LoadAsync"/> избранные</label>
+    <span class="muted small">@_items.Count показано</span>
+</div>
+
+@foreach (var hiddenDraft in _drafts.Where(entry => !_items.Any(company => company.Id == entry.Key)))
+{
+    <div class="panel small">
+        <b>Компания #@hiddenDraft.Key: правка не сохранена</b>
+        <div>@_feedback.GetValueOrDefault(hiddenDraft.Key)</div>
+        <div>Избранное — @(hiddenDraft.Value.Watch ? "да" : "нет"), чёрный список — @(hiddenDraft.Value.Blacklisted ? "да" : "нет").</div>
+        <button disabled="@_saving.Contains(hiddenDraft.Key)" @onclick="() => ReloadCompany(hiddenDraft.Key)">Обновить строку и сбросить правку</button>
+    </div>
+}
+
+<div class="table-wrap">
+    <table>
+        <thead><tr>
+            <SortTh Key="name" Title="Компания" State="_sort" StateChanged="SortBy"/>
+            <th>Отрасли</th><th>Теги</th>
+            <SortTh Key="dotnet" Title=".NET" Class="num" DescFirst State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="open" Title="Всего" Class="num" DescFirst State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="rating" Title="Рейтинг" Class="num" DescFirst State="_sort" StateChanged="SortBy"/>
+            <th></th>
+        </tr></thead>
+        <tbody>
+        @foreach (var c in _items)
+        {
+            <tr>
+                <td>
+                    @if (c.HhId is not null)
+                    {
+                        <a href="https://hh.ru/employer/@c.HhId" target="_blank" rel="noopener">@c.Name</a>
+                    }
+                    else
+                    {
+                        @c.Name
+                    }
+                    @if (c.ItAccredited) { <span class="badge">IT-аккр.</span> }
+                    <div class="small muted">@c.Area @(c.Site is not null ? "· " + c.Site : "")</div>
+                </td>
+                <td class="small">@string.Join(", ", c.Industries)</td>
+                <td class="small">@string.Join(", ", c.Tags)</td>
+                <td class="num">@c.DotnetVacancies</td>
+                <td class="num">@c.OpenVacancies</td>
+                <td class="num">@c.Rating</td>
+                <td>
+                    <button title="Избранное" disabled="@_saving.Contains(c.Id)" @onclick="() => Toggle(c.Id, watch: true)">@(_snapshots[c.Id].Watch ? "★" : "☆")</button>
+                    <button title="Чёрный список" disabled="@_saving.Contains(c.Id)" class="@(_snapshots[c.Id].Blacklisted ? "danger" : "")" @onclick="() => Toggle(c.Id, watch: false)">⛔</button>
+                    @if (_feedback.TryGetValue(c.Id, out var feedback))
+                    {
+                        <div class="small muted">@feedback</div>
+                    }
+                    @if (_drafts.TryGetValue(c.Id, out var draft))
+                    {
+                        <div class="small">Не сохранено: избранное — @(draft.Watch ? "да" : "нет"), чёрный список — @(draft.Blacklisted ? "да" : "нет").</div>
+                        <button disabled="@_saving.Contains(c.Id)" @onclick="() => ReloadCompany(c.Id)">Обновить строку и сбросить правку</button>
+                    }
+                </td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private string _search = "";
+    private string _tag = "";
+    private bool _openOnly = true;
+    private bool _watchOnly;
+    private List<Company> _items = [];
+    private List<string> _tags = [];
+    private readonly Dictionary<long, CompanyPreferenceSnapshot> _snapshots = [];
+    private readonly Dictionary<long, CompanyPreferenceSnapshot> _drafts = [];
+    private readonly Dictionary<long, string> _feedback = [];
+    private readonly HashSet<long> _saving = [];
+
+    // Unsorted = favourites first, then by .NET vacancies.
+    private SortState _sort;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        _tags = (await ctx.Companies.Select(c => c.Tags).ToListAsync()).SelectMany(t => t).Distinct().Order().ToList();
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        IQueryable<Company> q = ctx.Companies.AsNoTracking();
+        if (_openOnly) q = q.Where(c => c.DotnetVacancies > 0);
+        if (_watchOnly) q = q.Where(c => c.Watch);
+        if (_tag.Length > 0) q = q.Where(c => c.Tags.Contains(_tag));
+        if (!string.IsNullOrWhiteSpace(_search))
+        {
+            var p = $"%{_search.Trim()}%";
+            q = q.Where(c => EF.Functions.ILike(c.Name, p) || (c.Description != null && EF.Functions.ILike(c.Description, p)));
+        }
+
+        var desc = _sort.Desc;
+        var ordered = _sort.Key switch
+        {
+            "name" => desc ? q.OrderByDescending(c => c.Name) : q.OrderBy(c => c.Name),
+            "dotnet" => desc ? q.OrderByDescending(c => c.DotnetVacancies) : q.OrderBy(c => c.DotnetVacancies),
+            "open" => desc ? q.OrderBy(c => c.OpenVacancies == null).ThenByDescending(c => c.OpenVacancies)
+                : q.OrderBy(c => c.OpenVacancies == null).ThenBy(c => c.OpenVacancies),
+            "rating" => desc ? q.OrderBy(c => c.Rating == null).ThenByDescending(c => c.Rating) : q.OrderBy(c => c.Rating == null).ThenBy(c => c.Rating),
+            _ => q.OrderByDescending(c => c.Watch).ThenByDescending(c => c.DotnetVacancies),
+        };
+        _items = await ordered.ThenBy(c => c.Name).Take(500).ToListAsync();
+        foreach (var company in _items)
+            if (!_drafts.ContainsKey(company.Id)) _snapshots[company.Id] = CompanyPreferenceSnapshot.Capture(company);
+    }
+
+    private Task SortBy(SortState sort)
+    {
+        _sort = sort;
+        return LoadAsync();
+    }
+
+    private async Task Toggle(long id, bool watch)
+    {
+        if (!_snapshots.TryGetValue(id, out var expected) || !_saving.Add(id)) return;
+        var desired = expected with { Watch = watch ? !expected.Watch : expected.Watch, Blacklisted = watch ? expected.Blacklisted : !expected.Blacklisted };
+        _drafts[id] = desired;
+        try
+        {
+            var result = await Preferences.SetAsync(expected, desired.Watch, desired.Blacklisted, CancellationToken.None);
+            if (!_snapshots.TryGetValue(id, out var displayed) || displayed != expected) return;
+            _feedback[id] = result.Message;
+            if (!result.Ok) return;
+            _drafts.Remove(id);
+            await LoadAsync();
+        }
+        catch (Exception error)
+        {
+            Log.Error("[company-preferences] failed to confirm company preference publication", error);
+            _feedback[id] = "Сохранение не подтверждено; правка и исходная версия сохранены. Проверьте строку перед повтором.";
+        }
+        finally { _saving.Remove(id); }
+    }
+
+    private async Task ReloadCompany(long id)
+    {
+        if (!_saving.Add(id)) return;
+        try
+        {
+            await using var context = await Db.CreateDbContextAsync();
+            var company = await context.Companies.AsNoTracking().SingleOrDefaultAsync(row => row.Id == id);
+            var index = _items.FindIndex(row => row.Id == id);
+            if (index >= 0)
+            {
+                if (company is null) _items.RemoveAt(index);
+                else _items[index] = company;
+            }
+            _drafts.Remove(id);
+            _feedback.Remove(id);
+            if (company is null) _snapshots.Remove(id);
+            else _snapshots[id] = CompanyPreferenceSnapshot.Capture(company);
+        }
+        finally { _saving.Remove(id); }
+    }
+}

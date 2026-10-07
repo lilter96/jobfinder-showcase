@@ -1,0 +1,304 @@
+@page "/interviews/{Id:long}"
+@using JobFinder.Llm.Tasks
+@using JobFinder.Pipeline.Modules.Preparation
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject InterviewProgress Progress
+@inject InterviewPrep Prep
+@inject InterviewSources Sources
+@inject Notifier Notifier
+@inject JobTriggers Triggers
+@inject NavigationManager Nav
+@inject JobFinder.Core.Time.LocalClock Clock
+
+<PageTitle>JobFinder · Подготовка · @(_v?.CompanyName ?? "")</PageTitle>
+
+@if (_c is null || _v is null || _i is null)
+{
+    <p class="muted">@(_loaded ? "Подготовки к этому интервью нет или она старого формата: страница «Интервью» → «Пересобрать»." : "Загрузка…")</p>
+    return;
+}
+
+<h1>🎯 @_v.CompanyName</h1>
+<div class="muted" style="margin:-8px 0 12px">
+    @(_c.Role.Length > 0 ? _c.Role : _v.Title) · @CareerCards.InterviewLabel(_i.Kind)
+    @if (_i.ScheduledAt is { } at) { <span> · @Ui.Local(at, "dd.MM HH:mm")</span> }
+    · риск <span class="badge @CopilotRules.Css(_c.OverallRisk)">@CopilotRules.Label(_c.OverallRisk)</span>
+    · выучено @Known из @_c.Preparation.Count
+</div>
+<Flash Message="@_flash" Error="@_error"/>
+<LearningProgressActions Editor="_learning" OnChanged="LearningChanged"/>
+@if (_error)
+{
+    <button @onclick="() => Nav.NavigateTo(Nav.Uri, forceLoad: true)">Обновить данные (сбросить несохранённые правки)</button>
+}
+
+<div class="toolbar">
+    <button class="@(Mode == "prep" ? "primary" : "")" @onclick="@(() => SetMode("prep"))">Подготовка</button>
+    <button class="@(Mode == "brief" ? "primary" : "")" @onclick="@(() => SetMode("brief"))">⏱ За 10 минут</button>
+    <button class="@(Mode == "learn" ? "primary" : "")" @onclick="@(() => SetMode("learn"))">🧠 Заучивание</button>
+    <span style="flex:1"></span>
+    <button disabled="@_busy" @onclick="SendRehearsal" title="Бот задаёт вопросы, вы отвечаете голосом, он сверяет с подготовленным">🎙 Прогон в боте</button>
+    @if (_i.PackPdfPath is not null) { <a class="btn" href="files/pack/@_i.Id" target="_blank">📄 PDF</a> }
+    <a class="btn" href="interviews">← Все интервью</a>
+</div>
+
+@if (Mode == "brief")
+{
+    var m = _c.LastMinute;
+    <div class="grid2">
+        <div>
+            <Say Title="Скажи о себе" Text="@m.About"/>
+            <Say Title="Почему компания" Text="@m.WhyCompany"/>
+            <Say Title="Почему эта роль" Text="@m.WhyRole"/>
+            @if (_c.Salary?.A is { } salary) { <Say Title="Если спросят про деньги" Text="@(salary.Start + " " + salary.Core)"/> }
+        </div>
+        <div>
+            <div class="panel">
+                <b>3 сильных кейса</b>
+                <ol class="tight">@foreach (var s in m.TopStories) { <li><b>@s.Title</b><div class="small muted">@s.Line</div></li> }</ol>
+            </div>
+            <div class="panel">
+                <b>3 риска</b>
+                <ul class="tight">@foreach (var r in m.TopRisks) { <li>@r</li> }</ul>
+            </div>
+            <div class="panel">
+                <b>Технические темы: как начать</b>
+                @foreach (var t in m.TopTopics) { <div style="margin-top:6px"><div class="small muted">@t.Topic</div><div>@t.Line</div></div> }
+            </div>
+            <div class="panel">
+                <b>Уточнения: как начать</b>
+                @foreach (var f in m.FollowUps) { <div style="margin-top:6px"><div class="small muted">@f.Topic</div><div>@f.Line</div></div> }
+            </div>
+            @if (m.DoNotSay.Count > 0)
+            {
+                <div class="panel">
+                    <b>Не говорить</b>
+                    @foreach (var d in m.DoNotSay) { <div class="small" style="margin-top:4px"><span class="dont-say">«@d.Say»</span> → @d.Instead</div> }
+                </div>
+            }
+            @if (_c.EmployerQuestions.MustAsk.Count > 0)
+            {
+                <div class="panel">
+                    <b>Обязательно спросить</b>
+                    <ol class="tight">@foreach (var q in _c.EmployerQuestions.MustAsk) { <li>@q.Question</li> }</ol>
+                </div>
+            }
+        </div>
+    </div>
+}
+else if (Mode == "learn")
+{
+    <LearnDeck Items="_c.Preparation" Learned="_learned" OnMark="x => Mark(x.Item, x.State)" OnReset="ResetLearning"/>
+}
+else
+{
+    @if (_c.Priorities.Count > 0)
+    {
+        <div class="panel">
+            <b>Что реально важно на этом интервью</b>
+            <ol class="prio-list">
+                @foreach (var p in _c.Priorities)
+                {
+                    <li>
+                        <b>@p.Topic</b>
+                        <span class="badge @CopilotRules.Css(p.Priority)">@CopilotRules.Label(p.Priority)</span>
+                        <span class="badge @CopilotRules.Css(p.CandidateLevel)">@CopilotRules.Label(p.CandidateLevel)</span>
+                        <span class="small muted">@CopilotRules.Label(p.Basis)</span>
+                        <div class="small">@p.Reason</div>
+                        @if (p.Evidence.Length > 0) { <div class="small muted">Основание: @p.Evidence</div> }
+                    </li>
+                }
+            </ol>
+        </div>
+    }
+
+    <div class="panel small">
+        📘 Здесь вопросы под эту компанию. Общие HR-вопросы (сильные и слабые стороны, конфликты, сроки, переработки, другие офферы) с ответами
+        и заучиванием: <a href="hr">HR-ответы</a>.
+    </div>
+
+    <h2>Вопросы и ответы</h2>
+    @foreach (var item in _c.Preparation)
+    {
+        <Question Item="item" Evidence="_c.Evidence" State="@_learned.GetValueOrDefault(item.Q.Id)" Approved="_approved.Contains(ApprovalKey(item))"
+                  OnMark="s => Mark(item, s)" OnApprove="() => Approve(item)" OnPosition="text => SavePosition(item, text)"/>
+    }
+
+    @if (_c.Gaps.Count > 0)
+    {
+        <h2>Пробелы: что подтянуть и как сказать</h2>
+        @foreach (var g in _c.Gaps)
+        {
+            <div class="panel">
+                <b>@g.Topic</b> <span class="badge @CopilotRules.Css(g.Level)">@CopilotRules.Label(g.Level)</span>
+                @if (g.Known.Length > 0) { <div class="small" style="margin-top:6px"><span class="muted">Рядом в опыте:</span> @g.Known</div> }
+                @if (g.Learn.Count > 0) { <div class="small muted" style="margin-top:6px">Повторить перед интервью</div><ul class="tight small">@foreach (var l in g.Learn) { <li>@l</li> }</ul> }
+                @if (g.SafeWording.Length > 0) { <div class="speech" style="margin-top:6px">@g.SafeWording</div> }
+                @if (g.DoNotSay.Count > 0) { <div class="small" style="margin-top:4px">Не говорить: @foreach (var d in g.DoNotSay) { <span class="dont-say">«@d»</span><span> </span> }</div> }
+            </div>
+        }
+    }
+
+    <div class="grid2">
+        <div>
+            <h2>Переговоры</h2>
+            <div class="panel">
+                @if (_c.Salary is { } s)
+                {
+                    <Question Item="s" Evidence="_c.Evidence" State="@_learned.GetValueOrDefault(s.Q.Id)" Approved="_approved.Contains(ApprovalKey(s))"
+                              OnMark="st => Mark(s, st)" OnApprove="() => Approve(s)" OnPosition="text => SavePosition(s, text)" Compact="true"/>
+                }
+                @if (_c.Negotiation.Stance.Length > 0) { <p class="small">@_c.Negotiation.Stance</p> }
+                @if (_c.Negotiation.Market.Length > 0) { <p class="small muted">Рынок: @_c.Negotiation.Market</p> }
+                @if (_c.Negotiation.Conditions.Count > 0) { <div class="small muted">Согласовать</div><ul class="tight small">@foreach (var x in _c.Negotiation.Conditions) { <li>@x</li> }</ul> }
+            </div>
+        </div>
+        <div>
+            <h2>Вопросы работодателю</h2>
+            <div class="panel">
+                <b class="small">Обязательно</b>
+                <ol class="tight small">@foreach (var q in _c.EmployerQuestions.MustAsk) { <li>@q.Question <span class="muted">· @q.Why</span></li> }</ol>
+                @if (_c.EmployerQuestions.NiceToAsk.Count > 0)
+                {
+                    <b class="small">Если останется время</b>
+                    <ol class="tight small">@foreach (var q in _c.EmployerQuestions.NiceToAsk) { <li>@q.Question <span class="muted">· @q.Why</span></li> }</ol>
+                }
+            </div>
+        </div>
+    </div>
+
+    @if (_c.Risks.Count > 0)
+    {
+        <h2>Риски</h2>
+        <div class="panel">
+            @foreach (var r in _c.Risks)
+            {
+                <div class="small" style="margin-bottom:6px"><span class="badge @CopilotRules.Css(r.Severity)">@CopilotRules.Label(r.Severity)</span> <b>@r.Risk</b> · @r.Mitigation</div>
+            }
+        </div>
+    }
+
+    <details class="panel">
+        <summary><b>О компании</b> <span class="small muted">справка, на которой построена подготовка</span></summary>
+        <p class="small" style="margin-top:8px">@_c.Company.Brief</p>
+        @if (_c.Company.WhatTheyLookFor.Count > 0) { <div class="small muted">Что им важно</div><ul class="tight small">@foreach (var x in _c.Company.WhatTheyLookFor) { <li>@x</li> }</ul> }
+        @if (_c.Company.SystemDesignThemes.Count > 0) { <div class="small muted">System design</div><ul class="tight small">@foreach (var x in _c.Company.SystemDesignThemes) { <li>@x</li> }</ul> }
+        @if (_c.Company.CodingThemes.Count > 0) { <div class="small muted">Live-coding</div><ul class="tight small">@foreach (var x in _c.Company.CodingThemes) { <li>@x</li> }</ul> }
+        @if (_c.Company.ToVerify.Count > 0) { <div class="small muted">Из знаний модели, проверить</div><ul class="tight small">@foreach (var x in _c.Company.ToVerify) { <li>@x</li> }</ul> }
+        <div class="small muted">Собрано @Ui.Local(_c.GeneratedAt) · @_c.Model · $@_c.CostUsd.ToString("0.###", CultureInfo.InvariantCulture)</div>
+    </details>
+}
+
+@code {
+    [Parameter] public long Id { get; set; }
+
+    [SupplyParameterFromQuery(Name = "mode")] public string? ModeQuery { get; set; }
+
+    private Interview? _i;
+    private Vacancy? _v;
+    private InterviewCopilot? _c;
+    private LearningProgressEditor? _learning;
+    private long? _learningInterviewId;
+    private Dictionary<string, string> _learned => _learning?.Snapshot?.Learned ?? [];
+    private HashSet<string> _approved => _learning?.Snapshot?.Approved ?? [];
+    private bool _loaded;
+    private string? _flash;
+    private bool _error;
+    private bool _busy;
+    private Dictionary<string, InterviewPositionSnapshot> _positions = [];
+
+    private string Mode => ModeQuery is "brief" or "learn" ? ModeQuery : "prep";
+
+    private int Known => _c?.Preparation.Count(p => _learned.GetValueOrDefault(p.Q.Id) == InterviewProgress.Known) ?? 0;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (_loaded && _i?.Id == Id) return;
+        await using var ctx = await Db.CreateDbContextAsync();
+        _i = await ctx.Interviews.AsNoTracking().Include(i => i.Application).ThenInclude(a => a!.Vacancy).FirstOrDefaultAsync(i => i.Id == Id);
+        _v = _i?.Application?.Vacancy;
+        var c = InterviewPrep.Read(_i?.PackJson);
+        _c = c is { Version: InterviewCopilot.CurrentVersion } ? c : null;
+        _positions = [];
+        if (_i is not null && _c is not null)
+        {
+            var questions = _c.Preparation.Select(item => item.Q.Id).Concat(_c.Salary is { } salary ? [salary.Q.Id] : []).ToArray();
+            var snapshots = await Sources.CapturePositionsAsync(Id, questions, CancellationToken.None);
+            foreach (var (questionId, snapshot) in snapshots)
+            {
+                if (snapshot.Interview.Matches(_i)
+                    && snapshot.PackHash == JobFinder.Core.Text.CanonicalJson.Hash(_i.PackJson!)) _positions[questionId] = snapshot;
+            }
+        }
+        if (_learningInterviewId != Id) { _learning = new(Progress, InterviewProgress.Scope(Id)); _learningInterviewId = Id; }
+        await _learning!.LoadAsync(CancellationToken.None);
+        _loaded = true;
+    }
+
+    private void SetMode(string mode) => Nav.NavigateTo(Nav.GetUriWithQueryParameter("mode", mode == "prep" ? null : mode));
+
+    private async Task<bool> Mark(PrepItem item, string state)
+    {
+        return _learning is not null && await _learning.MarkAsync(item.Q.Id, state, CancellationToken.None);
+    }
+
+    private void LearningChanged()
+    {
+        if (_c is not null) _c.Preparation = [.. _c.Preparation];
+    }
+
+    private async Task Approve(PrepItem item)
+    {
+        var key = ApprovalKey(item);
+        var approved = !_approved.Contains(key);
+        if (_learning is not null) await _learning.ApproveAsync(key, approved, CancellationToken.None);
+    }
+
+    /// <summary>A check holds for the answer text it was made on: a rewritten answer is checked again.</summary>
+    private static string ApprovalKey(PrepItem i) => i.Fingerprint is null ? i.Q.Id : $"{i.Q.Id}:{i.Fingerprint}";
+
+    private async Task SavePosition(PrepItem item, string text)
+    {
+        try
+        {
+            if (!_positions.TryGetValue(item.Q.Id, out var snapshot)) throw new InterviewEditConflictException();
+            var result = await Prep.SavePositionAsync(snapshot, text, CancellationToken.None);
+            _flash = result.Message;
+            _error = !result.Ok;
+        }
+        catch (Exception error)
+        {
+            _flash = error.Message;
+            _error = true;
+        }
+    }
+
+    private async Task ResetLearning()
+    {
+        if (_learning is not null && await _learning.ResetAsync(CancellationToken.None))
+            _c = _c is null ? null : _c with { Preparation = [.. _c.Preparation] };
+    }
+
+    private async Task SendRehearsal()
+    {
+        _busy = true;
+        try
+        {
+            await Notifier.SendAsync(NotificationKind.Info,
+                $"🧠 <b>Прогон ответов</b> · {TextUtil.EscapeHtml(_v!.CompanyName ?? "")} — {TextUtil.EscapeHtml(_v.Title)}\n" +
+                "Я задаю вопросы из подготовки, вы отвечаете голосом, как на звонке. Сверю с подготовленным ответом и покажу его.",
+                [[Callback.Button("🧠 Начать прогон", CareerCallback.InterviewRehearse, Id)]], Id, CancellationToken.None);
+            _flash = "Кнопка прогона отправлена в бот";
+            _error = false;
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+}

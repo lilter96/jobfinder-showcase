@@ -1,0 +1,103 @@
+@page "/threads"
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject ApprovalService Approvals
+@inject JobFinder.Integrations.Threads.ThreadsGateway Gateway
+
+<PageTitle>JobFinder · Threads</PageTitle>
+<h1>Threads: комментарии</h1>
+<p class="muted small">
+    Режим: @(Gateway.UsesApi ? "официальный API" : _configured ? "браузерная сессия" : "не настроен (Threads:AccessToken или --login threads)").
+    Черновики ожидают вашего выбора; при включённой автоматической публикации проверенный вариант отправляется без выбора.
+</p>
+<Flash Message="@_flash" Error="@_error"/>
+
+<div class="toolbar">
+    <select @bind="_status" @bind:after="LoadAsync">
+        @foreach (var s in Enum.GetValues<CommentStatus>())
+        {
+            <option value="@s">@s</option>
+        }
+    </select>
+    <span class="muted small">@_items.Count</span>
+    <button @onclick="LoadAsync">Обновить</button>
+</div>
+
+@foreach (var d in _items)
+{
+    <div class="panel">
+        <div class="small muted">
+            <span class="badge">@Cards.AudienceLabel(d.Audience)</span>
+            <a href="@d.PostUrl" target="_blank" rel="noopener">@@@d.Author</a> · @Ui.Local(d.PostPublishedAt ?? d.CreatedAt)
+            @if (d.Error is not null) { <span style="color:var(--bad)"> · @d.Error</span> }
+        </div>
+        <div class="pre" style="margin:8px 0">@TextUtil.Truncate(d.PostText, 1200)</div>
+        @if (d.Reason is not null) { <div class="small muted"><i>@d.Reason</i></div> }
+        @if (d.Status == CommentStatus.Pending)
+        {
+            @for (var i = 0; i < d.Variants.Count; i++)
+            {
+                var index = i;
+                <div class="variant">
+                    <span>@d.Variants[index]</span>
+                    <button class="primary" @onclick="() => Pick(d, index)">Опубликовать</button>
+                </div>
+            }
+            <textarea placeholder="Свой вариант" style="min-height:70px" @bind="_custom[d.Id]"></textarea>
+            <div class="toolbar" style="margin-top:6px">
+                <button @onclick="() => Custom(d)">Опубликовать свой</button>
+                <button class="danger" @onclick="() => Reject(d)">Пропустить</button>
+            </div>
+        }
+        else if (d.ChosenText is not null)
+        {
+            <div class="variant"><span>@d.ChosenText</span><span class="badge @(d.Status == CommentStatus.Posted ? "good" : "")">@d.Status</span></div>
+        }
+        @if (d.Status == CommentStatus.Approved)
+        {
+            <button class="danger" @onclick="() => Cancel(d)">Отменить публикацию</button>
+        }
+        @if (d.Status == CommentStatus.OutcomeUnknown && d.DeliveryRequestId is { } requestId)
+        {
+            <div class="small muted">Повтор остановлен. Проверьте пост и выполните --comment-reconcile @requestId с результатом ручной сверки.</div>
+        }
+    </div>
+}
+
+@code {
+    private CommentStatus _status = CommentStatus.Pending;
+    private bool _configured;
+    private List<CommentDraft> _items = [];
+    private readonly Dictionary<long, string> _custom = new();
+    private string? _flash;
+    private bool _error;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _configured = await Gateway.IsConfiguredAsync(CancellationToken.None);
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        _items = await ctx.CommentDrafts.AsNoTracking().Where(d => d.Status == _status).OrderByDescending(d => d.CreatedAt).Take(100).ToListAsync();
+        _custom.Clear();
+        foreach (var d in _items) _custom.TryAdd(d.Id, "");
+    }
+
+    private Task Pick(CommentDraft draft, int index) => Act(Approvals.PickCommentAsync(JobFinder.Pipeline.Modules.Engagement.CommentDecisions.Snapshot(draft), index, CancellationToken.None));
+
+    private Task Custom(CommentDraft draft) => Act(Approvals.SetCommentAsync(JobFinder.Pipeline.Modules.Engagement.CommentDecisions.Snapshot(draft), _custom.GetValueOrDefault(draft.Id) ?? "", CancellationToken.None));
+
+    private Task Reject(CommentDraft draft) => Act(Approvals.RejectCommentAsync(JobFinder.Pipeline.Modules.Engagement.CommentDecisions.Snapshot(draft), CancellationToken.None));
+
+    private Task Cancel(CommentDraft draft) => Act(Approvals.CancelCommentAsync(JobFinder.Pipeline.Modules.Engagement.CommentDecisions.Snapshot(draft), CancellationToken.None));
+
+    private async Task Act(Task<ActionResult> action)
+    {
+        var result = await action;
+        _flash = result.Message;
+        _error = !result.Ok;
+        if (result.Ok) await LoadAsync();
+    }
+}

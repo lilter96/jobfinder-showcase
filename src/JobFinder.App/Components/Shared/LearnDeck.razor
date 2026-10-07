@@ -1,0 +1,66 @@
+@using JobFinder.Llm.Tasks
+@* Learning by cards: the question → say it aloud → the start → 30 seconds → 60 seconds → known / again. Not learned first, then by
+   priority; "known" leaves the deck, "again" goes to its end. *@
+@if (_deck.Count == 0)
+{
+    <div class="panel">Все вопросы отмечены как выученные. <button @onclick="() => OnReset.InvokeAsync()">Начать заново</button></div>
+}
+else
+{
+    var item = _deck[0];
+    var a = item.A!;
+    <div class="panel flashcard">
+        <div class="small muted">
+            Осталось @_deck.Count · @CopilotRules.Label(item.Q.Category) · @CopilotRules.Label(item.Q.Priority)
+            @if (Learned.GetValueOrDefault(item.Q.Id) == InterviewProgress.Again) { <span class="badge warn">повторить</span> }
+        </div>
+        <div class="flash-q">@item.Q.Question</div>
+        <div class="small muted">Скажите ответ вслух, как на звонке, потом откройте и сравните.</div>
+        @if (_stage >= 1) { <div class="speech-start">@a.Start</div> }
+        @if (_stage >= 2) { <div class="speech"><span class="t">30 сек</span> @a.Core</div> }
+        @if (_stage >= 3 && a.Extended is { } ext) { <div class="speech"><span class="t">60 сек</span> @ext</div> }
+        @if (_stage >= 2 && a.DoNotSay.Count > 0)
+        {
+            <div class="small" style="margin-top:8px">@foreach (var d in a.DoNotSay) { <div><span class="dont-say">«@d.Say»</span> → @d.Instead</div> }</div>
+        }
+        <div class="toolbar" style="margin-top:12px">
+            @if (_stage == 0) { <button class="primary" @onclick="() => _stage = 1">Показать начало</button> }
+            else if (_stage == 1) { <button class="primary" @onclick="() => _stage = 2">Показать 30 сек</button> }
+            else if (_stage == 2 && a.Extended is not null) { <button @onclick="() => _stage = 3">Показать 60 сек</button> }
+            <span style="flex:1"></span>
+            <button class="good-btn" @onclick="() => Mark(item, InterviewProgress.Known)">✅ Знаю</button>
+            <button @onclick="() => Mark(item, InterviewProgress.Again)">🔁 Повторить</button>
+        </div>
+    </div>
+    <div class="small muted">Сначала невыученные и самые важные. «Повторить» отправляет карточку в конец колоды.</div>
+}
+
+@code {
+    [Parameter, EditorRequired] public IReadOnlyList<PrepItem> Items { get; set; } = [];
+    [Parameter, EditorRequired] public Dictionary<string, string> Learned { get; set; } = [];
+    [Parameter] public Func<(PrepItem Item, string State), Task<bool>>? OnMark { get; set; }
+    [Parameter] public EventCallback OnReset { get; set; }
+
+    private List<PrepItem> _deck = [];
+    private IReadOnlyList<PrepItem>? _built;
+    private int _stage;
+
+    protected override void OnParametersSet()
+    {
+        // A new set of items (another page, a reset) rebuilds the deck; a mark only moves the card.
+        if (ReferenceEquals(_built, Items) && _deck.Count > 0) return;
+        _built = Items;
+        _deck = Items.Where(p => p.HasSpeech && Learned.GetValueOrDefault(p.Q.Id) != InterviewProgress.Known)
+            .OrderBy(p => Learned.GetValueOrDefault(p.Q.Id) == InterviewProgress.Again ? 1 : 0)
+            .ThenBy(p => CopilotRules.Rank(p.Q.Priority)).ThenBy(p => CopilotRules.Rank(p.Q.Likelihood)).ToList();
+        _stage = 0;
+    }
+
+    private async Task Mark(PrepItem item, string state)
+    {
+        if (OnMark is null || !await OnMark((item, state))) return;
+        _deck.Remove(item);
+        if (state == InterviewProgress.Again) _deck.Add(item);
+        _stage = 0;
+    }
+}

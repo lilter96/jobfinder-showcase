@@ -1,0 +1,14 @@
+@* The score as a colored pill: green = auto-apply zone, yellow = approval zone, red = below. *@
+<span class="badge @Css">@(Value?.ToString(CultureInfo.InvariantCulture) ?? "—")</span>
+
+@code {
+    [Parameter] public int? Value { get; set; }
+
+    private string Css => Value switch
+    {
+        null => "",
+        >= 80 => "good",
+        >= 60 => "warn",
+        _ => "bad",
+    };
+}

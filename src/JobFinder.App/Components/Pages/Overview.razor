@@ -1,0 +1,179 @@
+@page "/"
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject JobTriggers Triggers
+@inject RuntimeSettings Settings
+@inject JobFinder.Pipeline.Modules.Hiring.ApplicationBlocks Blocks
+@inject JobFinder.Pipeline.Modules.Hiring.ApplicationAutomationControls AutomationControls
+@inject JobFinder.Core.Time.LocalClock Clock
+@inject JobFinder.Llm.Client.ModelHealth Models
+@inject JobFinder.Integrations.HeadHunter.HhApplier Applier
+@inject JobFinder.Integrations.Telegram.TelegramUserClient Telegram
+@implements IDisposable
+
+<PageTitle>JobFinder · Обзор</PageTitle>
+<h1>Обзор</h1>
+<Flash Message="@_flash"/>
+
+<div class="cards">
+    <div class="card"><div class="label">Новых сегодня</div><div class="value">@_newToday</div></div>
+    <div class="card"><div class="label">Ждут решения</div><div class="value"><a href="vacancies?decision=Approval">@_waiting</a></div></div>
+    <div class="card"><div class="label">Автооткликов сегодня</div><div class="value">@_autoToday / @_decision?.DailyAutoApplyLimit</div></div>
+    <div class="card"><div class="label">Откликов всего</div><div class="value">@_sentTotal</div></div>
+    <div class="card"><div class="label">В очередях</div><div class="value small">постов @_queuePosts · вакансий @_queueVacancies · откликов @_queueApps</div></div>
+    <div class="card"><div class="label">LLM сегодня</div><div class="value">$@_spent.ToString("0.###", CultureInfo.InvariantCulture)</div></div>
+</div>
+
+<div class="panel">
+    <div class="toolbar" style="margin:0">
+        <span>Автоотклики: <b>@(_decision?.AutoApplyPaused == true ? "пауза" : "включены")</b>@(_dryRun ? " (dry-run)" : "")</span>
+        <span class="muted">·</span>
+        <span>Сессия hh: <b>@(_hhSession ? "есть" : "нет — --login hh")</b>@(_blockedUntil > Clock.UtcNow ? $", пауза до {Ui.Local(_blockedUntil, "HH:mm")}" : "")</span>
+        <span class="muted">·</span>
+        <span>Telegram: <b>@(Telegram.IsReady ? "подключён" : "не подключён")</b></span>
+        <span style="flex:1"></span>
+        <button @onclick="TogglePause" disabled="@(_policy is null || _controlConflict || _controlBusy)">@(_decision?.AutoApplyPaused == true ? "▶️ Включить автоотклики" : "⏸ Пауза")</button>
+        @if (_controlConflict) { <button @onclick="ReloadControls">Загрузить актуальное состояние</button> }
+    </div>
+</div>
+
+<h2>Джобы</h2>
+<div class="table-wrap">
+    <table>
+        <thead><tr><th>Джоб</th><th>Последний запуск</th><th>Статус</th><th class="num">Элементов</th><th>Сообщение</th><th></th></tr></thead>
+        <tbody>
+        @foreach (var name in Triggers.Names.Order())
+        {
+            var run = _runs.GetValueOrDefault(name);
+            <tr>
+                <td class="mono">@name</td>
+                <td>@Ui.Local(run?.StartedAt)</td>
+                <td>
+                    @if (run is not null)
+                    {
+                        <span class="badge @(run.Status == JobRunStatus.Ok ? "good" : run.Status == JobRunStatus.Failed ? "bad" : "warn")">@run.Status</span>
+                    }
+                </td>
+                <td class="num">@run?.Items</td>
+                <td class="small muted">@TextUtil.Truncate(run?.Message, 140)</td>
+                <td><button @onclick="() => Run(name)">Запустить</button></td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</div>
+
+<h2>Модели LLM</h2>
+@if (_models.Count == 0)
+{
+    <p class="muted">Вызовов ещё не было.</p>
+}
+else
+{
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Модель</th><th>Состояние</th><th class="num">Ошибок подряд</th><th>Последняя ошибка</th></tr></thead>
+            <tbody>
+            @foreach (var m in _models)
+            {
+                <tr>
+                    <td class="mono">@m.Model</td>
+                    <td>@(m.BlockedFor is { } b ? $"пауза {b.TotalMinutes:0} мин" : "ok")</td>
+                    <td class="num">@m.ConsecutiveFailures</td>
+                    <td class="small muted">@TextUtil.Truncate(m.LastError, 160)</td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+}
+
+@code {
+    private int _newToday, _waiting, _autoToday, _sentTotal, _queuePosts, _queueVacancies, _queueApps;
+    private decimal _spent;
+    private bool _dryRun, _hhSession;
+    private DateTimeOffset? _blockedUntil;
+    private JobFinder.Core.Filtering.DecisionSettings? _decision;
+    private PolicySnapshot<AutomationPolicy>? _policy;
+    private JobFinder.Pipeline.Modules.Hiring.ApplicationBlockSnapshot? _block;
+    private bool _controlConflict, _controlBusy;
+    private bool? _pauseDraft;
+    private Dictionary<string, JobRun> _runs = [];
+    private IReadOnlyList<JobFinder.Llm.Client.ModelHealthSnapshot> _models = [];
+    private string? _flash;
+    private Timer? _timer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadAsync();
+        _timer = new Timer(_ => InvokeAsync(async () =>
+        {
+            await LoadAsync();
+            StateHasChanged();
+        }), null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+    }
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        var today = Clock.StartOfTodayUtc();
+        _newToday = await ctx.Vacancies.CountAsync(v => v.FirstSeenAt >= today);
+        _waiting = await ctx.Vacancies.CountAsync(v => v.Status == VacancyStatus.Scored && v.Decision == Decision.Approval);
+        _autoToday = await ctx.Applications.CountAsync(JobFinder.Pipeline.Workers.ApplyWorker.CountsTowardAutoLimit(today));
+        _sentTotal = await ctx.Applications.CountAsync(a => a.Status == ApplicationStatus.Sent);
+        _queuePosts = await ctx.RawPosts.CountAsync(p => p.Status == RawPostStatus.New);
+        _queueVacancies = await ctx.Vacancies.CountAsync(v => v.Status == VacancyStatus.New);
+        _queueApps = await ctx.Applications.CountAsync(a => a.Status == ApplicationStatus.Pending);
+        _spent = await ctx.LlmCalls.Where(c => c.At >= today).SumAsync(c => c.CostUsd);
+        var recent = await ctx.JobRuns.Where(r => r.StartedAt >= Clock.UtcNow.AddDays(-2)).OrderByDescending(r => r.StartedAt).Take(500).ToListAsync();
+        _runs = recent.GroupBy(r => r.Job).ToDictionary(g => g.Key, g => g.First());
+        if (!_controlConflict && !_controlBusy) await RefreshControlsAsync(false);
+        _hhSession = await Applier.HasSessionAsync(CancellationToken.None);
+        _models = Models.Snapshot();
+    }
+
+    private void Run(string name) => _flash = Triggers.Trigger(name) ? $"{name}: запущен" : $"{name}: не найден";
+
+    private async Task TogglePause()
+    {
+        if (_policy is null || _controlConflict || _controlBusy) return;
+        var expected = _policy;
+        var block = _block;
+        _pauseDraft = !expected.Value.AutoApplyPaused;
+        _controlBusy = true;
+        try
+        {
+            await AutomationControls.SetPauseAsync(expected, _pauseDraft.Value, block, "dashboard", CancellationToken.None);
+            await ReloadControls();
+            _flash = _decision?.AutoApplyPaused == true ? "Автоотклики приостановлены" : "Автоотклики включены";
+        }
+        catch (Exception error) when (error is PolicyConflictException or JobFinder.Pipeline.Modules.Hiring.ApplicationBlockConflictException)
+        {
+            _controlConflict = true;
+            _flash = $"Состояние изменилось. Ваше действие «{(_pauseDraft == true ? "пауза" : "включить") }» не применено; загрузите актуальное состояние.";
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            _controlConflict = true;
+            _flash = "Изменение не подтверждено. Исходное состояние и ваше действие сохранены; загрузите актуальное состояние перед повтором.";
+        }
+        finally { _controlBusy = false; }
+    }
+
+    private Task ReloadControls() => RefreshControlsAsync(true);
+
+    private async Task RefreshControlsAsync(bool explicitReload)
+    {
+        var policy = await Settings.Automation.ReadAsync(CancellationToken.None);
+        var block = await Blocks.ReadAsync(CancellationToken.None);
+        if (!explicitReload && (_controlConflict || _controlBusy)) return;
+        _policy = policy;
+        _block = block;
+        _decision = new(policy.Value.AutoApplyThreshold, policy.Value.ApprovalThreshold, policy.Value.DailyAutoApplyLimit, policy.Value.AutoApplyPaused);
+        _dryRun = policy.Value.ApplyDryRun;
+        _blockedUntil = block.Until;
+        _pauseDraft = null;
+        _controlConflict = false;
+    }
+
+    public void Dispose() => _timer?.Dispose();
+}

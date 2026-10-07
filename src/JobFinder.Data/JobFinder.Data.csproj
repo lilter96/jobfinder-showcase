@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <ItemGroup>
+        <EmbeddedResource Include="Storage\Scripts\Wolverine.6.41.0.sql"/>
+        <EmbeddedResource Include="Storage\Scripts\Wolverine.LetterQueues.6.41.0.sql"/>
+        <EmbeddedResource Include="Storage\Scripts\Wolverine.ReplyQueue.6.41.0.sql"/>
+        <EmbeddedResource Include="Storage\Scripts\Wolverine.BotControlsQueue.6.41.0.sql"/>
+    </ItemGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\JobFinder.Core\JobFinder.Core.csproj"/>
+    </ItemGroup>
+    <ItemGroup>
+        <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3"/>
+        <PackageReference Include="EFCore.NamingConventions" Version="10.0.1"/>
+        <!-- Pins EF Core for every consumer: Npgsql alone would bring 10.0.4 while the Design package needs 10.0.12. -->
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.12"/>
+        <!-- The dashboard's data-protection key ring lives in this database (JobFinderDbContext is its key context). -->
+        <PackageReference Include="Microsoft.AspNetCore.DataProtection.EntityFrameworkCore" Version="10.0.12"/>
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.12">
+            <PrivateAssets>all</PrivateAssets>
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+    </ItemGroup>
+</Project>

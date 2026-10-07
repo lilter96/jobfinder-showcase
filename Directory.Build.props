@@ -1,0 +1,16 @@
+<Project>
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <LangVersion>preview</LangVersion>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <DebugType>embedded</DebugType>
+        <!-- Cyrillic text is lower-cased and compared culture-aware: keep ICU (no InvariantGlobalization). -->
+    </PropertyGroup>
+    <ItemGroup>
+        <!-- Every project logs through ILogger with the pre-formatted helpers (Info/Warn/Error/Debug). -->
+        <Using Include="Microsoft.Extensions.Logging"/>
+        <Using Include="JobFinder.Core.Logging"/>
+    </ItemGroup>
+</Project>

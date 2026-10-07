@@ -1,0 +1,173 @@
+@page "/channels"
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject ApprovalService Approvals
+@using JobFinder.Pipeline.Modules.Discovery
+
+<PageTitle>JobFinder · Каналы</PageTitle>
+<h1>Telegram-каналы и чаты</h1>
+<p class="muted small">
+    Аккаунт подписывается только на одобренные (постепенно, с паузами), мьютит их, убирает в архив и в папку. Чаты, добавленные в папку вручную,
+    тоже мониторятся. Список предложений — <span class="mono">config/telegram-channels.json</span>.
+</p>
+<Flash Message="@_flash" Error="@_error"/>
+
+<div class="toolbar">
+    <select @bind="_status" @bind:after="LoadAsync">
+        <option value="">Все</option>
+        @foreach (var s in Enum.GetValues<ChannelStatus>())
+        {
+            <option value="@s">@s (@_counts.GetValueOrDefault(s))</option>
+        }
+    </select>
+    <button class="primary" disabled="@(_proposed.Count == 0 || _batchConflict || _busy)" @onclick="ApproveAll">Одобрить показанную подборку (@_proposed.Count)</button>
+    @if (_batchConflict) { <button @onclick="ReloadControls">Загрузить актуальные каналы</button> }
+</div>
+
+@if (_batchConflict)
+{
+    <div class="panel small">
+        <b>Не сохранён выбор подборки:</b>
+        @string.Join(", ", _proposed.Select(snapshot => snapshot.Username is null ? $"#{snapshot.Id}" : "@" + snapshot.Username))
+    </div>
+}
+
+@foreach (var hidden in _feedback.Where(entry => !_items.Any(channel => channel.Id == entry.Key)))
+{
+    <div class="panel small">
+        <b>Канал #@hidden.Key: выбор не сохранён</b>
+        <div>@hidden.Value</div>
+        <div>Ваш выбор: @_desired.GetValueOrDefault(hidden.Key)</div>
+        <button disabled="@_busy" @onclick="() => ReloadChannel(hidden.Key)">Загрузить актуальный канал и сбросить выбор</button>
+    </div>
+}
+
+<div class="table-wrap">
+    <table>
+        <thead><tr><th>Канал</th><th>Тип</th><th>Почему</th><th>Статус</th><th class="num">Постов</th><th class="num">Вакансий</th><th></th></tr></thead>
+        <tbody>
+        @foreach (var c in _items)
+        {
+            <tr>
+                <td>
+                    @if (_feedback.TryGetValue(c.Id, out var feedback))
+                    {
+                        <div class="small">@feedback</div>
+                        <div class="small">Ваш выбор: @_desired.GetValueOrDefault(c.Id)</div>
+                        <button disabled="@_busy" @onclick="() => ReloadChannel(c.Id)">Загрузить актуальный канал</button>
+                    }
+                    @if (c.Username is not null)
+                    {
+                        <a href="https://t.me/@c.Username" target="_blank" rel="noopener">@@@c.Username</a>
+                    }
+                    <div class="small muted">@c.Title</div>
+                </td>
+                <td class="small">@(c.Kind == ChannelKind.Channel ? "канал" : "чат")</td>
+                <td class="small">@c.Reason</td>
+                <td>
+                    <span class="badge @(c.Status == ChannelStatus.Joined ? "good" : c.Status == ChannelStatus.Failed ? "bad" : c.Status == ChannelStatus.Approved ? "warn" : "")">@c.Status</span>
+                    @if (c.Error is not null) { <div class="small" style="color:var(--bad)">@c.Error</div> }
+                </td>
+                <td class="num">@c.PostsSeen</td>
+                <td class="num">@c.VacanciesFound</td>
+                <td>
+                    @if (c.Status is ChannelStatus.Proposed or ChannelStatus.Rejected or ChannelStatus.Failed)
+                    {
+                        <button disabled="@(_busy || _feedback.ContainsKey(c.Id))" @onclick="() => Set(c.Id, ChannelStatus.Approved)">Одобрить</button>
+                    }
+                    @if (c.Status is ChannelStatus.Proposed or ChannelStatus.Approved)
+                    {
+                        <button class="danger" disabled="@(_busy || _feedback.ContainsKey(c.Id))" @onclick="() => Set(c.Id, ChannelStatus.Rejected)">Отклонить</button>
+                    }
+                </td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private string _status = "";
+    private List<TelegramChannel> _items = [];
+    private Dictionary<ChannelStatus, int> _counts = [];
+    private string? _flash;
+    private bool _error;
+    private bool _busy, _batchConflict;
+    private List<ChannelDecisionSnapshot> _proposed = [];
+    private readonly Dictionary<long, ChannelDecisionSnapshot> _snapshots = [];
+    private readonly Dictionary<long, ChannelStatus> _desired = [];
+    private readonly Dictionary<long, string> _feedback = [];
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        _counts = await ctx.TelegramChannels.GroupBy(c => c.Status).ToDictionaryAsync(g => g.Key, g => g.Count());
+        var all = await ctx.TelegramChannels.AsNoTracking().OrderByDescending(c => c.VacanciesFound).ThenBy(c => c.Username).ToListAsync();
+        foreach (var channel in all)
+            if (!_busy && !_feedback.ContainsKey(channel.Id)) _snapshots[channel.Id] = ChannelDecisionSnapshot.Capture(channel);
+        foreach (var id in _snapshots.Keys.Where(id => !_feedback.ContainsKey(id) && !all.Any(channel => channel.Id == id)).ToArray())
+            if (!_busy) _snapshots.Remove(id);
+        _items = Enum.TryParse<ChannelStatus>(_status, out var status) ? all.Where(channel => channel.Status == status || _feedback.ContainsKey(channel.Id)).ToList() : all;
+        if (!_busy && !_batchConflict) _proposed = _items.Where(channel => channel.Status == ChannelStatus.Proposed).Select(ChannelDecisionSnapshot.Capture).ToList();
+    }
+
+    private async Task ApproveAll()
+    {
+        if (_busy || _batchConflict || _proposed.Count == 0) return;
+        _busy = true;
+        try
+        {
+            var result = await Approvals.ApproveChannelsAsync(_proposed.ToArray(), CancellationToken.None);
+            _batchConflict = !result.Ok;
+            _flash = result.Message;
+            _error = !result.Ok;
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            _batchConflict = _error = true;
+            _flash = "Изменение подборки не подтверждено. Исходный выбор сохранён; загрузите актуальные каналы перед повтором.";
+        }
+        finally { _busy = false; }
+        await LoadAsync();
+    }
+
+    private async Task Set(long id, ChannelStatus status)
+    {
+        if (_busy || _feedback.ContainsKey(id) || !_snapshots.TryGetValue(id, out var expected)) return;
+        _desired[id] = status;
+        _busy = true;
+        try
+        {
+            var result = await Approvals.SetChannelStatusAsync(expected, status, CancellationToken.None);
+            if (result.Ok) { _desired.Remove(id); _feedback.Remove(id); }
+            else _feedback[id] = result.Message;
+            _flash = result.Message;
+            _error = !result.Ok;
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            _error = true;
+            _flash = _feedback[id] = "Изменение не подтверждено; исходный выбор сохранён до явной загрузки.";
+        }
+        finally { _busy = false; }
+        await LoadAsync();
+    }
+
+    private async Task ReloadControls()
+    {
+        if (_busy) return;
+        _feedback.Clear();
+        _desired.Clear();
+        _batchConflict = false;
+        await LoadAsync();
+    }
+
+    private async Task ReloadChannel(long id)
+    {
+        if (_busy) return;
+        _feedback.Remove(id);
+        _desired.Remove(id);
+        await LoadAsync();
+    }
+}

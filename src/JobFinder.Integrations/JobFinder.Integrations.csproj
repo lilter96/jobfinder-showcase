@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <ItemGroup>
+        <InternalsVisibleTo Include="JobFinder.Tests" />
+    </ItemGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\JobFinder.Core\JobFinder.Core.csproj" />
+    </ItemGroup>
+    <ItemGroup>
+        <PackageReference Include="AngleSharp" Version="1.8.2" />
+        <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.12" />
+        <PackageReference Include="Microsoft.Playwright" Version="1.63.0" />
+        <PackageReference Include="SmartReader" Version="0.11.1" />
+        <PackageReference Include="WTelegramClient" Version="4.4.8" />
+        <PackageReference Include="MailKit" Version="4.18.0" />
+        <!-- Scraping limits: the circuit breaker and the timeout (Polly), request budgets and pacing (System.Threading.RateLimiting). -->
+        <PackageReference Include="Polly.Core" Version="8.8.0" />
+        <PackageReference Include="System.Threading.RateLimiting" Version="10.0.12" />
+    </ItemGroup>
+</Project>

@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+    </PropertyGroup>
+    <ItemGroup>
+        <FrameworkReference Include="Microsoft.AspNetCore.App" />
+        <ProjectReference Include="../../src/JobFinder.Data/JobFinder.Data.csproj" />
+        <ProjectReference Include="../../src/JobFinder.Pipeline/JobFinder.Pipeline.csproj" />
+        <PackageReference Include="WolverineFx.EntityFrameworkCore" Version="6.41.0" />
+        <PackageReference Include="WolverineFx.Postgresql" Version="6.41.0" />
+        <PackageReference Include="WolverineFx.RuntimeCompilation" Version="6.41.0" />
+    </ItemGroup>
+</Project>

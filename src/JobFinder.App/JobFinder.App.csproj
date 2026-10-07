@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+    <ItemGroup>
+        <InternalsVisibleTo Include="JobFinder.Tests" />
+    </ItemGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\JobFinder.Bot\JobFinder.Bot.csproj" />
+        <ProjectReference Include="..\JobFinder.Pipeline\JobFinder.Pipeline.csproj" />
+        <ProjectReference Include="..\JobFinder.ServiceDefaults\JobFinder.ServiceDefaults.csproj" />
+    </ItemGroup>
+    <ItemGroup>
+        <!-- Repo-root config, prompts and document assets: visible in the IDE, copied to the build/publish output (the container layout). -->
+        <Content Include="..\..\config\appsettings.json" Link="config\appsettings.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <Content Include="..\..\config\telegram-channels.json" Link="config\telegram-channels.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\..\config\telegram-channels.json')" />
+        <Content Include="..\..\prompts\*.md" Link="prompts\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <Content Include="..\..\assets\**\*" Link="assets\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+</Project>

@@ -1,0 +1,13 @@
+@* A piece of speech to say aloud, with how long it takes. *@
+@if (!string.IsNullOrWhiteSpace(Text))
+{
+    <div class="panel">
+        <b>@Title</b> <span class="small muted">@CopilotRules.Seconds(Text)</span>
+        <div class="speech" style="margin-top:6px">@Text</div>
+    </div>
+}
+
+@code {
+    [Parameter, EditorRequired] public string Title { get; set; } = "";
+    [Parameter] public string? Text { get; set; }
+}

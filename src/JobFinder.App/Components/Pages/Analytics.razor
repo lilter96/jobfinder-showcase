@@ -1,0 +1,362 @@
+@page "/analytics"
+@using System.Text.Json
+@using JobFinder.Core.Filtering
+@using JobFinder.Llm.Tasks
+@using JobFinder.Pipeline.Market
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject MarketService Market
+@inject WeeklyReportJob Report
+@inject RuntimeSettings Settings
+@inject JobFinder.Core.Time.LocalClock Clock
+@inject JobFinder.Pipeline.Profile.ProfileProvider Profiles
+@inject RejectionReviewService Rejections
+
+<PageTitle>JobFinder · Аналитика</PageTitle>
+<h1>Аналитика</h1>
+<Flash Message="@_flash" Error="@_error"/>
+
+<div class="cards">
+    <div class="card"><div class="label">Откликов</div><div class="value">@_all.Sent</div></div>
+    <div class="card"><div class="label">Ответ</div><div class="value">@Pct(_all.Replied, _all.Sent)</div></div>
+    <div class="card"><div class="label">Интервью</div><div class="value">@Pct(_all.Interviews, _all.Sent)</div></div>
+    <div class="card"><div class="label">Офферы</div><div class="value">@_all.Offers</div></div>
+    <div class="card"><div class="label">До первого ответа (медиана)</div><div class="value">@(_medianReplyDays is { } d ? $"{d:0.#} дн." : "—")</div></div>
+    <div class="card"><div class="label">LLM за 30 дней</div><div class="value">$@_spent30.ToString("0.##", CultureInfo.InvariantCulture)</div></div>
+</div>
+
+<div class="grid2">
+    <div>
+        <div class="panel">
+            <b>Воронка</b>
+            <svg class="chart" viewBox="0 0 600 150" role="img" aria-label="Воронка">
+                @for (var i = 0; i < _funnelBars.Count; i++)
+                {
+                    var (label, value) = _funnelBars[i];
+                    var width = Math.Max(2, _all.Sent == 0 ? 0 : 440.0 * value / _all.Sent);
+                    <g>
+                        <text x="0" y="@(i * 36 + 22)">@label</text>
+                        <rect class="bar @(i == 0 ? "" : "alt")" x="120" y="@(i * 36 + 8)" width="@F(width)" height="22" rx="4"/>
+                        <text x="@F(126 + width)" y="@(i * 36 + 24)">@value</text>
+                    </g>
+                }
+            </svg>
+        </div>
+
+        <div class="panel">
+            <b>Отклики и ответы по неделям</b>
+            @{ var max = Math.Max(1, _weeks.Count == 0 ? 1 : _weeks.Max(w => w.Sent)); var colW = _weeks.Count == 0 ? 0 : 560.0 / _weeks.Count; }
+            <svg class="chart" viewBox="0 0 600 190" role="img" aria-label="По неделям">
+                <line class="axis" x1="30" y1="160" x2="590" y2="160"/>
+                @for (var i = 0; i < _weeks.Count; i++)
+                {
+                    var w = _weeks[i];
+                    var x = 34 + i * colW;
+                    var h = 140.0 * w.Sent / max;
+                    var hr = 140.0 * w.Replied / max;
+                    <g>
+                        <rect class="bar" x="@F(x)" y="@F(160 - h)" width="@F(colW * 0.42)" height="@F(h)" rx="3"/>
+                        <rect class="bar alt" x="@F(x + colW * 0.45)" y="@F(160 - hr)" width="@F(colW * 0.42)" height="@F(hr)" rx="3"/>
+                        <text x="@F(x)" y="176">@w.Label</text>
+                        <text x="@F(x)" y="@F(156 - h)">@(w.Sent > 0 ? w.Sent.ToString(CultureInfo.InvariantCulture) : "")</text>
+                    </g>
+                }
+            </svg>
+            <div class="small muted">синие — отправлено, зелёные — получили ответ</div>
+        </div>
+
+        <div class="panel">
+            <b>Что работает</b>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Срез</th><th class="num">Откликов</th><th class="num">Ответ</th><th class="num">Интервью</th><th class="num">Отказ</th></tr></thead>
+                    <tbody>
+                    @foreach (var (label, s) in _slices)
+                    {
+                        <tr><td>@label</td><td class="num">@s.Sent</td><td class="num">@Pct(s.Replied, s.Sent)</td><td class="num">@Pct(s.Interviews, s.Sent)</td><td class="num">@Pct(s.Rejected, s.Sent)</td></tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="panel">
+            <b>Рынок (net USD в месяц, @_snapshot?.Total вакансий с зарплатой за 60 дней)</b>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Сегмент</th><th class="num">n</th><th class="num">p25</th><th class="num">медиана</th><th class="num">p75</th><th class="num">p90</th></tr></thead>
+                    <tbody>
+                    @foreach (var s in _snapshot is null ? [] : _snapshot.Segments.OrderBy(s => s.Seniority).ThenByDescending(s => s.Count).ToList())
+                    {
+                        <tr>
+                            <td>@MarketSnapshot.SegmentLabel(s)</td><td class="num">@s.Count</td>
+                            <td class="num">@MarketSnapshot.Money(s.P25)</td><td class="num"><b>@MarketSnapshot.Money(s.P50)</b></td>
+                            <td class="num">@MarketSnapshot.Money(s.P75)</td><td class="num">@MarketSnapshot.Money(s.P90)</td>
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+            <div class="small muted">Сегмент показывается, когда в нём ≥ @MarketSnapshot.MinCount вакансий с зарплатой. Ваша планка — @_desired.</div>
+        </div>
+    </div>
+
+    <div>
+        <div class="panel">
+            <b>Спрос за 30 дней</b> <span class="small muted">ключевые слова подходящих вакансий (≥ 60); жёлтые — не упомянуты в резюме</span>
+            <div class="chips" style="margin-top:8px">
+                @foreach (var item in _demand)
+                {
+                    <span class="chip @(_gaps.Contains(Name(item)) ? "miss" : "ok")">@item</span>
+                }
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="toolbar" style="margin:0">
+                <b>Резюме на hh</b>
+                <span style="flex:1"></span>
+                <button disabled="@_busy" @onclick="BuildReport">@(_busy ? "Собираю…" : "🔄 Отчёт и советы сейчас")</button>
+            </div>
+            @if (_advice is null)
+            {
+                <p class="muted small">Советы появятся после первого недельного отчёта (воскресенье 18:00) или по кнопке.</p>
+            }
+            else
+            {
+                <div class="small muted" style="margin-top:8px">Заголовок</div>
+                <div class="mono">@_advice.Title</div>
+                <div class="small muted" style="margin-top:8px">О себе</div>
+                <div class="pre small">@_advice.About</div>
+                @if (_advice.SkillsToAdd.Count > 0) { <div class="small muted" style="margin-top:8px">Добавить в «Ключевые навыки»</div><div class="chips">@foreach (var s in _advice.SkillsToAdd) { <span class="chip ok">@s</span> }</div> }
+                @if (_advice.Improvements.Count > 0) { <div class="small muted" style="margin-top:8px">Правки</div><ul class="tight small">@foreach (var i in _advice.Improvements) { <li>@i</li> }</ul> }
+                @if (_advice.MarketGaps.Count > 0) { <div class="small muted">Подтянуть (не писать в резюме)</div><div class="chips">@foreach (var s in _advice.MarketGaps) { <span class="chip miss">@s</span> }</div> }
+            }
+        </div>
+
+        @if (_report is not null)
+        {
+            <div class="panel tg small">@((MarkupString)_report)</div>
+        }
+    </div>
+</div>
+
+<div class="panel">
+    <div class="toolbar" style="margin:0">
+        <b>Разбор отказов</b>
+        <span class="small muted">все отклики с hh, ваши на сайте и системы; «молчание» — нет ответа @RejectionAnalysis.SilentAfterDays дней</span>
+        <span style="flex:1"></span>
+        <button disabled="@_busy" @onclick="Review">@(_busy ? "Разбираю…" : "🔍 Разобрать отказы")</button>
+    </div>
+    <div class="table-wrap" style="margin-top:10px">
+        <table>
+            <thead><tr>
+                <th>Исход</th><th class="num">Откликов</th><th class="num">Скор</th><th class="num">Стек</th><th class="num">Грейд</th><th class="num">Домен</th>
+                <th class="num">Формат</th><th class="num">ATS-покрытие</th><th class="num">Англ. B2+</th><th class="num">Формат/локация &lt; 50</th>
+                <th class="num">Зарплата ниже</th><th class="num">Фильтр отсеял бы</th><th class="num">С письмом</th><th class="num">Дней до исхода</th>
+            </tr></thead>
+            <tbody>
+            @foreach (var g in _groups.Where(g => g.Count > 0))
+            {
+                <tr>
+                    <td>@RejectionReviewService.OutcomeLabel(g.Outcome)</td><td class="num">@g.Count</td><td class="num">@F(g.Score)</td>
+                    <td class="num">@F(g.Stack)</td><td class="num">@F(g.Seniority)</td><td class="num">@F(g.Domain)</td><td class="num">@F(g.Format)</td>
+                    <td class="num">@(g.Coverage is { } c ? c.ToString("P0", CultureInfo.InvariantCulture) : "—")</td>
+                    <td class="num">@Share(g.EnglishB2Plus, g.Count)</td><td class="num">@Share(g.FormatWeak, g.Count)</td>
+                    <td class="num">@Share(g.SalaryBelow, g.Count)</td><td class="num">@Share(g.FilterWouldReject, g.Count)</td>
+                    <td class="num">@(g.LetterKnown == 0 ? "?" : $"{g.WithLetter} из {g.LetterKnown}")</td><td class="num">@F(g.MedianDays)</td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+    <div class="grid2" style="margin-top:10px">
+        <div>
+            <div class="small muted">Ключи вакансий, которых нет в резюме: у отказов</div>
+            <div class="chips">@foreach (var (k, n) in _missingRejected) { <span class="chip miss">@k · @n</span> }</div>
+            <div class="small muted" style="margin-top:8px">…и у откликов с ответом</div>
+            <div class="chips">@foreach (var (k, n) in _missingPositive) { <span class="chip">@k · @n</span> }</div>
+        </div>
+        <div>
+            <div class="small muted">Как быстро отказывают</div>
+            <div class="chips">@foreach (var (bucket, n) in _speed) { <span class="chip">@bucket: @n</span> }</div>
+            <div class="small muted" style="margin-top:8px">Быстрый отказ чаще значит фильтр или беглый взгляд на заголовок, формат, локацию и ключи.</div>
+        </div>
+    </div>
+
+    @if (_review is { } r)
+    {
+        <div style="margin-top:14px">
+            <div class="small muted">Выводы модели · @Ui.Local(_reviewAt)</div>
+            <p>@r.Summary</p>
+            @if (r.Reasons.Count > 0)
+            {
+                <b class="small">Причины</b>
+                <ol class="tight small">@foreach (var x in r.Reasons) { <li><b>@x.Reason</b><div class="muted">@x.Evidence</div></li> }</ol>
+            }
+            @if (r.ResumeFixes.Count > 0) { <b class="small">Правки резюме</b><ul class="tight small">@foreach (var x in r.ResumeFixes) { <li>@x</li> }</ul> }
+            @if (r.KeywordsToAdd.Count > 0) { <div class="small muted" style="margin-top:6px">Назвать в резюме (опыт это подразумевает)</div><div class="chips">@foreach (var x in r.KeywordsToAdd) { <span class="chip ok">@x</span> }</div> }
+            @if (r.SearchFixes.Count > 0) { <b class="small">Какие вакансии не брать</b><ul class="tight small">@foreach (var x in r.SearchFixes) { <li>@x</li> }</ul> }
+            @if (r.Learn.Count > 0) { <div class="small muted" style="margin-top:6px">Подтянуть (не писать в резюме)</div><div class="chips">@foreach (var x in r.Learn) { <span class="chip miss">@x</span> }</div> }
+        </div>
+    }
+    else
+    {
+        <p class="small muted" style="margin-top:10px">Выводы модели появятся по кнопке «Разобрать отказы».</p>
+    }
+
+    @if (_rejections.Count > 0)
+    {
+        <details style="margin-top:10px">
+            <summary class="small">Отказы по вакансиям: @_rejections.Count</summary>
+            <div class="table-wrap" style="margin-top:6px">
+                <table>
+                    <thead><tr><th>Вакансия</th><th class="num">Скор</th><th class="num">Дней</th><th>Что могло помешать</th></tr></thead>
+                    <tbody>
+                    @foreach (var f in _rejections)
+                    {
+                        <tr>
+                            <td><a href="vacancies/@f.VacancyId">@f.Title</a><div class="small muted">@f.Company</div></td>
+                            <td class="num"><Score Value="f.Score"/></td>
+                            <td class="num">@F(f.DaysToOutcome)</td>
+                            <td class="small">@string.Join("; ", f.Suspects())</td>
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+        </details>
+    }
+</div>
+
+@code {
+    private sealed record Week(string Label, int Sent, int Replied);
+
+    private FunnelStats _all;
+    private List<(string Label, int Value)> _funnelBars = [];
+    private List<Week> _weeks = [];
+    private List<(string Label, FunnelStats Stats)> _slices = [];
+    private MarketSnapshot? _snapshot;
+    private List<string> _demand = [];
+    private HashSet<string> _gaps = [];
+    private HhResumeAdvice? _advice;
+    private string? _report;
+    private double? _medianReplyDays;
+    private decimal _spent30;
+    private string _desired = "—";
+    private string? _flash;
+    private bool _error;
+    private bool _busy;
+    private List<OutcomeGroup> _groups = [];
+    private List<(string Keyword, int Count)> _missingRejected = [];
+    private List<(string Keyword, int Count)> _missingPositive = [];
+    private List<(string Bucket, int Count)> _speed = [];
+    private List<ResponseFacts> _rejections = [];
+    private RejectionReview? _review;
+    private DateTimeOffset? _reviewAt;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        var apps = await ctx.Applications.AsNoTracking().Include(a => a.Vacancy)
+            .Where(a => a.Status == ApplicationStatus.Sent && a.SentAt != null).ToListAsync();
+        _all = FunnelStats.Of(apps);
+        _funnelBars = [("Отправлено", _all.Sent), ("Ответили", _all.Replied), ("Интервью", _all.Interviews), ("Оффер", _all.Offers)];
+
+        var today = Clock.Now.Date;
+        var monday = today.AddDays(-(((int)today.DayOfWeek + 6) % 7));
+        _weeks = Enumerable.Range(0, 10).Select(i => monday.AddDays(-7 * (9 - i))).Select(start =>
+        {
+            var inWeek = apps.Where(a => TimeZoneInfo.ConvertTime(a.SentAt!.Value, Clock.Zone).Date is var d && d >= start && d < start.AddDays(7)).ToList();
+            return new Week(start.ToString("dd.MM", CultureInfo.InvariantCulture), inWeek.Count, FunnelStats.Of(inWeek).Replied);
+        }).ToList();
+
+        _slices = [];
+        foreach (var g in apps.GroupBy(a => a.Channel).OrderByDescending(g => g.Count())) _slices.Add(("канал: " + WeeklyReportJob.ChannelLabel(g.Key), FunnelStats.Of(g)));
+        foreach (var g in apps.GroupBy(a => a.Mode)) _slices.Add((g.Key == ApplicationMode.Auto ? "режим: авто" : "режим: одобрен", FunnelStats.Of(g)));
+        foreach (var g in apps.Where(a => a.Vacancy?.Score is not null).GroupBy(a => a.Vacancy!.Score >= 80 ? "оценка ≥ 80" : "оценка 60–79").OrderBy(g => g.Key))
+            _slices.Add((g.Key, FunnelStats.Of(g)));
+        foreach (var g in apps.Where(a => a.Vacancy is not null).GroupBy(a => MarketSnapshot.GeoOf(a.Vacancy!)).OrderByDescending(g => g.Count()))
+            _slices.Add(("гео: " + g.Key, FunnelStats.Of(g)));
+        _slices.Add(("с резюме под вакансию", FunnelStats.Of(apps.Where(a => a.TailoredResumeId is not null))));
+
+        var firstReplies = await ctx.ApplicationEvents.AsNoTracking().Where(e => e.Kind == EventKind.MessageIn || (e.Kind == EventKind.StageChanged && e.Channel != EventChannel.Manual))
+            .GroupBy(e => e.ApplicationId).Select(g => new { g.Key, At = g.Min(e => e.At) }).ToListAsync();
+        var sentAt = apps.ToDictionary(a => a.Id, a => a.SentAt!.Value);
+        var delays = firstReplies.Where(r => sentAt.ContainsKey(r.Key)).Select(r => (r.At - sentAt[r.Key]).TotalDays).Where(d => d >= 0).Order().ToList();
+        _medianReplyDays = delays.Count == 0 ? null : delays[delays.Count / 2];
+        _spent30 = await ctx.LlmCalls.Where(c => c.At >= Clock.UtcNow.AddDays(-30)).SumAsync(c => c.CostUsd);
+
+        _snapshot = await Market.SnapshotAsync(CancellationToken.None);
+        var (_, top, gaps) = await Report.DemandAsync(ctx, CancellationToken.None);
+        _demand = top.Take(35).ToList();
+        _gaps = gaps.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        (_report, _advice) = await Report.LatestAsync(CancellationToken.None);
+        _desired = (await Profiles.GetAsync(CancellationToken.None))?.DesiredSalary is { } want
+            ? $"{want.Amount:#,0} {want.Currency} net"
+            : "не задана (Настройки → профиль, desiredSalary)";
+
+        var facts = await Rejections.FactsAsync(CancellationToken.None);
+        _groups = Enum.GetValues<ResponseOutcome>().Select(o => RejectionAnalysis.Group(o, facts)).ToList();
+        _missingRejected = RejectionAnalysis.MissingKeywords(facts, ResponseOutcome.Rejected, 25);
+        _missingPositive = RejectionAnalysis.MissingKeywords(facts, ResponseOutcome.Positive, 15);
+        _speed = RejectionAnalysis.RejectionSpeed(facts);
+        _rejections = facts.Where(f => f.Outcome == ResponseOutcome.Rejected).OrderByDescending(f => f.Score).ToList();
+        (_review, _reviewAt) = await Rejections.LatestAsync(CancellationToken.None);
+    }
+
+    private static string F(double? v) => v is null ? "—" : v.Value.ToString("0.#", CultureInfo.InvariantCulture);
+
+    private static string Share(int part, int total) => total == 0 ? "—" : $"{100.0 * part / total:0}%";
+
+    private async Task Review()
+    {
+        _busy = true;
+        try
+        {
+            var result = await Rejections.ReviewAsync(CancellationToken.None);
+            _flash = result.Message;
+            _error = !result.Ok;
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        await LoadAsync();
+    }
+
+    private static string Name(string item) => item.LastIndexOf(" (", StringComparison.Ordinal) is var i and > 0 ? item[..i] : item;
+
+    private static string Pct(int part, int total) => total == 0 ? "—" : $"{part} · {100.0 * part / total:0}%";
+
+    private static string F(double v) => v.ToString("0.#", CultureInfo.InvariantCulture);
+
+    private async Task BuildReport()
+    {
+        _busy = true;
+        try
+        {
+            await Report.RequestAsync(CancellationToken.None);
+            _flash = "Статистика сохранена. Советы hh, если нужны, готовятся отдельно.";
+            _error = false;
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        await LoadAsync();
+    }
+}

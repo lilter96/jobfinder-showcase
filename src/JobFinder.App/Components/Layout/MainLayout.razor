@@ -1,0 +1,32 @@
+@inherits LayoutComponentBase
+
+<div class="shell">
+    <nav class="nav">
+        <div class="brand">JobFinder</div>
+        <NavLink href="" Match="NavLinkMatch.All">Обзор</NavLink>
+        <NavLink href="vacancies">Вакансии</NavLink>
+        <NavLink href="applications">Отклики</NavLink>
+        <NavLink href="pipeline">Воронка</NavLink>
+        <NavLink href="interviews">Интервью</NavLink>
+        <NavLink href="hr">HR-ответы</NavLink>
+        <NavLink href="stories">Истории</NavLink>
+        <NavLink href="facts">Факты</NavLink>
+        <NavLink href="contacts">Контакты</NavLink>
+        <NavLink href="offers">Офферы</NavLink>
+        <NavLink href="analytics">Аналитика</NavLink>
+        <NavLink href="companies">Компании</NavLink>
+        <NavLink href="threads">Threads</NavLink>
+        <NavLink href="channels">Каналы</NavLink>
+        <NavLink href="settings">Настройки</NavLink>
+        @* Observability (docker compose): the .NET Aspire dashboard (traces, logs, metrics) and Prometheus (metric history). *@
+        <a class="nav-ext" href="http://127.0.0.1:18888" target="_blank" rel="noopener">Телеметрия ↗</a>
+        <a class="nav-ext" href="http://127.0.0.1:9090" target="_blank" rel="noopener">Prometheus ↗</a>
+    </nav>
+    <main class="main">
+        @Body
+    </main>
+</div>
+
+<div id="blazor-error-ui" class="error-ui">
+    Ошибка на странице. <a href="" class="reload">Перезагрузить</a>
+</div>

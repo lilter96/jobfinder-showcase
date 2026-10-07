@@ -1,0 +1,209 @@
+@page "/hr"
+@using JobFinder.Llm.Tasks
+@using JobFinder.Pipeline.Modules.Preparation
+@inject HrPlaybookService Hr
+@inject IGeneratedAnswerStore Store
+@inject InterviewProgress Progress
+@inject Notifier Notifier
+@inject NavigationManager Nav
+
+<PageTitle>JobFinder · HR-ответы</PageTitle>
+<h1>📘 HR-ответы</h1>
+<p class="muted small" style="margin-top:-6px">
+    Все частые HR-вопросы с готовой речью на 15, 30 и 60 секунд из вашего опыта, фактов и историй: учится один раз, работает на любом интервью.
+    Вопросы под конкретную компанию (о себе, почему вы, первые шаги, деньги) заново готовятся к каждому интервью, здесь их общий вариант.
+</p>
+<Flash Message="@_flash" Error="@_error"/>
+<LearningProgressActions Editor="_learning" OnChanged="LearningChanged"/>
+
+@if (_missing.Count > 0)
+{
+    <div class="panel check-box">
+        Для части ответов не хватает ваших фактов: @string.Join(", ", _missing).
+        <a href="facts">Заполните на странице «Факты»</a> и нажмите «Пересобрать».
+    </div>
+}
+
+<div class="toolbar">
+    <button class="@(Mode == "answers" ? "primary" : "")" @onclick="@(() => SetMode(null))">Ответы</button>
+    <button class="@(Mode == "learn" ? "primary" : "")" @onclick="@(() => SetMode("learn"))">🧠 Заучивание</button>
+    <span class="small muted">
+        @if (_p is not null)
+        {
+            <span>выучено @Known из @_p.Items.Count · ждут вашего решения @Blockers · без изменений при последней сборке @_p.Items.Count(i => i.Item.Reused)
+                · собрано @Ui.Local(_p.GeneratedAt) · повторное использование сэкономило $@_saved.ToString("0.###", CultureInfo.InvariantCulture)</span>
+        }
+    </span>
+    <span style="flex:1"></span>
+    <button disabled="@(_busy || _p is null)" @onclick="SendRehearsal">🎙 Прогон в боте</button>
+    <button disabled="@(_busy || _building)" @onclick="Rebuild">@(_building ? "Собирается…" : _p is null ? "Собрать" : "🔄 Пересобрать")</button>
+    <button disabled="@_busy" @onclick="OnParametersSetAsync">Обновить данные</button>
+</div>
+
+@if (_p is null)
+{
+    <div class="panel muted">
+        @(_building ? "HR-ответы собираются: модель думает над каждым вопросом, это 20-30 минут. Придёт уведомление в бот." : "HR-ответы ещё не собраны: нажмите «Собрать».")
+    </div>
+}
+else if (Mode == "learn")
+{
+    <LearnDeck Items="_items" Learned="_learned" OnMark="x => Mark(x.Item, x.State)" OnReset="ResetLearning"/>
+}
+else
+{
+    @foreach (var group in _p.Items.GroupBy(i => i.Bank.Category).OrderBy(g => CategoryOrder(g.Key)))
+    {
+        <h2>@group.Key</h2>
+        @foreach (var entry in group.OrderBy(i => FrequencyOrder(i.Bank.Frequency)))
+        {
+            <div class="small muted" style="margin:10px 0 -8px 2px">
+                <span class="badge @(entry.Bank.Frequency == "всегда" ? "bad" : entry.Bank.Frequency == "часто" ? "warn" : "")">спрашивают @entry.Bank.Frequency</span>
+                @if (entry.Bank.Tailored) { <span> · под вакансию готовится в подготовке к интервью, здесь общий вариант</span> }
+            </div>
+            <Question Item="entry.Item" Evidence="_evidence" State="@_learned.GetValueOrDefault(entry.Item.Q.Id)" Approved="_approved.Contains(ApprovalKey(entry.Item))"
+                      OnMark="s => Mark(entry.Item, s)" OnApprove="() => Approve(entry.Item)" OnPosition="text => SavePosition(entry.Bank, text)"/>
+            <details class="small" style="margin:-10px 0 14px 4px">
+                <summary class="muted">Зачем спрашивают и как отвечать</summary>
+                <div style="margin:4px 0 0 12px">
+                    <div><span class="muted">Зачем:</span> @entry.Bank.Why</div>
+                    <div><span class="muted">Как отвечать:</span> @entry.Bank.Approach</div>
+                    <div><span class="dont-say">Как не надо:</span> @entry.Bank.Avoid</div>
+                </div>
+            </details>
+        }
+    }
+
+    <div class="small muted">Собрано @Ui.Local(_p.GeneratedAt) · @_p.Model · $@_p.CostUsd.ToString("0.###", CultureInfo.InvariantCulture)</div>
+}
+
+@code {
+    [SupplyParameterFromQuery(Name = "mode")] public string? ModeQuery { get; set; }
+
+    private HrPlaybook? _p;
+    private List<PrepItem> _items = [];
+    private IReadOnlyDictionary<string, HrPositionEditSnapshot> _positions = new Dictionary<string, HrPositionEditSnapshot>();
+    private LearningProgressEditor? _learning;
+    private Dictionary<string, string> _learned => _learning?.Snapshot?.Learned ?? [];
+    private HashSet<string> _approved => _learning?.Snapshot?.Approved ?? [];
+    private List<string> _missing = [];
+    private IReadOnlyDictionary<string, string> _evidence = new Dictionary<string, string>();
+    private bool _building;
+    private string? _flash;
+    private bool _error;
+    private bool _busy;
+
+    private string Mode => ModeQuery == "learn" ? "learn" : "answers";
+
+    private int Known => _items.Count(i => _learned.GetValueOrDefault(i.Q.Id) == InterviewProgress.Known);
+
+    private int Blockers => _items.Count(i => CopilotRules.EffectiveCheck(i) == "blocker" && !_approved.Contains(ApprovalKey(i)));
+
+    private decimal _saved;
+
+    /// <summary>A check holds for the answer text it was made on: a rewritten answer is checked again.</summary>
+    private static string ApprovalKey(PrepItem i) => i.Fingerprint is null ? i.Q.Id : $"{i.Q.Id}:{i.Fingerprint}";
+
+    private static readonly string[] Categories =
+    [
+        "Самопрезентация", "Сочетание ожиданий", "Мотивация", "Вовлечённость", "Вопрос с подвохом", "Планирование", "Работа с людьми",
+        "Работа над собой", "Процессы", "Формальность", "Увлечения", "Личные",
+    ];
+
+    private static int CategoryOrder(string c) => Array.IndexOf(Categories, c) is var i and >= 0 ? i : Categories.Length;
+
+    private static int FrequencyOrder(string f) => f switch { "всегда" => 0, "часто" => 1, _ => 2 };
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _p = await Hr.LatestAsync(CancellationToken.None);
+        _items = _p?.Items.Select(i => i.Item).ToList() ?? [];
+        _positions = await Hr.CapturePositionsAsync(_p?.Items.Select(item => item.Bank).ToList() ?? [], CancellationToken.None);
+        _learning ??= new(Progress, InterviewProgress.HrScope);
+        await _learning.LoadAsync(CancellationToken.None);
+        _saved = await Store.SavedUsdAsync(CancellationToken.None);
+        _missing = await Hr.MissingFactsAsync(CancellationToken.None);
+        _building = await Hr.RequestedAsync(CancellationToken.None) || _p is null;
+    }
+
+    private void SetMode(string? mode) => Nav.NavigateTo(Nav.GetUriWithQueryParameter("mode", mode));
+
+    private async Task<bool> Mark(PrepItem item, string state)
+    {
+        return _learning is not null && await _learning.MarkAsync(item.Q.Id, state, CancellationToken.None);
+    }
+
+    private async Task Approve(PrepItem item)
+    {
+        var key = ApprovalKey(item);
+        var approved = !_approved.Contains(key);
+        if (_learning is not null) await _learning.ApproveAsync(key, approved, CancellationToken.None);
+    }
+
+    private async Task ResetLearning()
+    {
+        if (_learning is not null && await _learning.ResetAsync(CancellationToken.None)) _items = [.. _items];
+    }
+
+    private void LearningChanged() => _items = [.. _items];
+
+    private async Task SavePosition(HrQuestion q, string text)
+    {
+        if (!_positions.TryGetValue(q.Id, out var snapshot))
+        {
+            _flash = "Вопрос изменился: сохраните текст и явно обновите данные.";
+            _error = true;
+            return;
+        }
+        try
+        {
+            var result = await Hr.SavePositionAsync(snapshot, text, CancellationToken.None);
+            _error = !result.Ok;
+            _flash = result.Message;
+            if (result.Ok) _building = true;
+        }
+        catch (Exception error)
+        {
+            _error = true;
+            _flash = "Не удалось сохранить: " + error.Message + ". Текст и исходная версия вопроса сохранены.";
+        }
+    }
+
+    private async Task Rebuild()
+    {
+        _busy = true;
+        try
+        {
+            await Hr.RequestAsync(CancellationToken.None);
+            _building = true;
+            _flash = "HR-ответы собираются: без изменений берутся из хранилища, новые пишутся заново; придёт уведомление в бот";
+            _error = false;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task SendRehearsal()
+    {
+        _busy = true;
+        try
+        {
+            await Notifier.SendAsync(NotificationKind.Info,
+                "🧠 <b>Прогон HR-ответов</b>\nЯ задаю HR-вопросы, вы отвечаете голосом, как на звонке. Сверю с подготовленным ответом и покажу его.",
+                [[Callback.Button("🧠 Начать прогон", CareerCallback.HrRehearse, 0)]], null, CancellationToken.None);
+            _flash = "Кнопка прогона отправлена в бот";
+            _error = false;
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+}

@@ -1,0 +1,23 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deterministic synthetic MTProto hash used only by storage tests"
+condition = "AND"
+paths = ['tests/JobFinder.Tests/Pipeline/StateStorageIntegrationTests\.cs$']
+regexTarget = "line"
+regexes = ['ApiHash = "0123456789abcdef0123456789abcdef"']
+
+[[allowlists]]
+description = "C# typed LinkedIn options parameter, not a credential"
+condition = "AND"
+paths = ['src/JobFinder.Pipeline/Career/Contacts\.cs$']
+regexTarget = "line"
+regexes = ['LinkedInClient linkedIn, LinkedInPeopleReader linkedInPeople, LinkedInOptions linkedInOptions']
+
+[[allowlists]]
+description = "Workflow admission documentation, not an API key"
+condition = "AND"
+paths = ['docs/REFACTORING\.md$']
+regexTarget = "line"
+regexes = ['Business-key admission, stage/round/envelope claims']

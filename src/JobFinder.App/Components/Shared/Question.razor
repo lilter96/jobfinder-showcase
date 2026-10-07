@@ -1,0 +1,146 @@
+@using JobFinder.Llm.Tasks
+@* One prepared question: the start to say first, then 30 and 60 seconds, the real case, where they will dig (each follow-up with its own
+   start), what not to say, and what to check. Learned / again marks, and "checked" for the guardrail's ⚠️. *@
+@{ var check = Approved ? "approved" : CopilotRules.EffectiveCheck(Item); }
+<div class="panel qcard @(check == "blocker" ? "needs-check" : "")">
+    <div class="toolbar" style="margin:0">
+        <b class="q-title">@Item.Q.Question</b>
+        <span class="badge">@CopilotRules.Label(Item.Q.Category)</span>
+        <span class="badge @CopilotRules.Css(Item.Q.Priority)">@CopilotRules.Label(Item.Q.Priority)</span>
+        <span class="badge @CopilotRules.Css(Item.Q.CandidateLevel)">@CopilotRules.Label(Item.Q.CandidateLevel)</span>
+        @if (Item.Reused) { <span class="small muted" title="Ничего, от чего зависит ответ, не менялось: взят из хранилища без вызова модели">без изменений</span> }
+        @if (State == InterviewProgress.Known) { <span class="badge good">выучено</span> }
+        else if (State == InterviewProgress.Again) { <span class="badge warn">повторить</span> }
+        <span style="flex:1"></span>
+        <button class="small-btn" title="Выучено" @onclick="() => OnMark.InvokeAsync(InterviewProgress.Known)">✅</button>
+        <button class="small-btn" title="Повторить" @onclick="() => OnMark.InvokeAsync(InterviewProgress.Again)">🔁</button>
+    </div>
+    @if (!Compact)
+    {
+        <div class="small muted" style="margin-top:4px">Проверяют: @Item.Q.Tests · вероятность @CopilotRules.Label(Item.Q.Likelihood) · @CopilotRules.Label(Item.Q.Basis)@(Item.Q.Source.Length > 0 ? " · " + Item.Q.Source : "")</div>
+    }
+    @if (Item.A is { NeedsPosition: true } position)
+    {
+        @* No speech is invented where only the candidate knows the answer: their position becomes a fact and the answer is written by it. *@
+        <div class="check-box">
+            <b>Нет подтверждённого ответа.</b> @string.Join("; ", Item.ApprovalReasons)
+            <div class="toolbar" style="margin:8px 0 0">
+                @foreach (var option in position.PositionOptions.Where(o => !string.IsNullOrWhiteSpace(o)))
+                {
+                    <button class="small-btn" disabled="@_saving" @onclick="() => Pick(option)">@option</button>
+                }
+            </div>
+            <div class="toolbar" style="margin:6px 0 0">
+                <input style="flex:1;min-width:260px" placeholder="Своими словами" @bind="_own" @bind:event="oninput"/>
+                <button class="small-btn" disabled="@(_saving || string.IsNullOrWhiteSpace(_own))" @onclick="() => Pick(_own!)">Сохранить</button>
+            </div>
+        </div>
+    }
+    else if (check == "approved")
+    {
+        <div class="small muted" style="margin-top:6px">✔ проверено вами <button class="small-btn" @onclick="() => OnApprove.InvokeAsync()">снять</button></div>
+    }
+    else if (check == "blocker")
+    {
+        <div class="check-box">
+            ⚠️ Решите перед интервью: @string.Join("; ", Item.ApprovalReasons)
+            @if (Item.A?.Verify.Count > 0) { <div>Сверить, что так и было: @string.Join("; ", Item.A.Verify)</div> }
+            <button class="small-btn" @onclick="() => OnApprove.InvokeAsync()">Проверил, так и скажу</button>
+            @if (Item.A?.EvidenceLevel == "unsupported" && OnPosition.HasDelegate)
+            {
+                @* Too little in the profile for this answer: a line on how it really was becomes a fact, and only this answer is rewritten. *@
+                <div class="toolbar" style="margin:6px 0 0">
+                    <input style="flex:1;min-width:260px" placeholder="Как было на самом деле: 1-2 фразы, ответ перепишется по ним" @bind="_own"/>
+                    <button class="small-btn" disabled="@(_saving || string.IsNullOrWhiteSpace(_own))" @onclick="() => Pick(_own!)">Сохранить</button>
+                </div>
+            }
+        </div>
+    }
+    else if (check == "review")
+    {
+        <details class="small" style="margin-top:6px">
+            <summary class="muted">ℹ️ выведено из опыта, глянуть (@(Item.A?.Verify.Count ?? 0))</summary>
+            <div style="margin:4px 0 0 12px">@string.Join("; ", Item.ApprovalReasons)
+                @if (Item.A?.Verify.Count > 0) { <div>@string.Join("; ", Item.A.Verify)</div> }
+                <button class="small-btn" @onclick="() => OnApprove.InvokeAsync()">Проверил</button>
+            </div>
+        </details>
+    }
+    @if (Item.HasSpeech && Item.A is { } a)
+    {
+        <div class="speech-start"><span class="t">начало @CopilotRules.Seconds(a.Start)</span> @a.Start</div>
+        <div class="speech"><span class="t">30 сек</span> @a.Core</div>
+        @if (a.Extended is { } ext)
+        {
+            <details><summary class="small">60 сек: развёрнуто</summary><div class="speech">@ext</div></details>
+        }
+        @if (Item.Q.Story is { } s)
+        {
+            <details>
+                <summary class="small">Кейс: @(Evidence.TryGetValue(s.Ref, out var story) ? Short(story) : s.Ref)</summary>
+                <div class="small" style="margin:4px 0 0 12px">
+                    <div><span class="muted">Почему этот кейс:</span> @s.WhyRelevant</div>
+                    @if (s.Contribution.Length > 0) { <div><span class="muted">Ваш вклад:</span> @s.Contribution</div> }
+                    @if (s.Result.Length > 0) { <div><span class="muted">Результат:</span> @s.Result</div> }
+                    @if (s.SupportedClaims.Count > 0) { <div><span class="muted">Можно утверждать:</span> @string.Join("; ", s.SupportedClaims)</div> }
+                </div>
+            </details>
+        }
+        @if (a.FollowUps.Count > 0 || a.DeepDive.Length > 0)
+        {
+            <details>
+                <summary class="small">Куда копнут дальше (@a.FollowUps.Count)</summary>
+                @if (a.DeepDive.Length > 0) { <div class="small muted" style="margin:4px 0 6px 12px">@a.DeepDive</div> }
+                @foreach (var f in a.FollowUps)
+                {
+                    <div class="followup">
+                        <div class="small"><b>→ @f.Question</b></div>
+                        <div class="speech-start small">@f.Start</div>
+                        <details><summary class="small muted">ответ</summary><div class="speech small">@f.Core</div>
+                            @if (f.Extended is { } fx) { <div class="speech small">@fx</div> }
+                        </details>
+                    </div>
+                }
+            </details>
+        }
+        @if (a.DoNotSay.Count > 0)
+        {
+            <div class="small" style="margin-top:6px">@foreach (var d in a.DoNotSay) { <div><span class="dont-say">Не говорить «@d.Say»</span> → @d.Instead</div> }</div>
+        }
+    }
+    else if (Item.A is null)
+    {
+        <div class="small muted" style="margin-top:6px">Ответ не собрался: пересоберите подготовку.</div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public PrepItem Item { get; set; } = new();
+    [Parameter] public IReadOnlyDictionary<string, string> Evidence { get; set; } = new Dictionary<string, string>();
+    [Parameter] public string? State { get; set; }
+    [Parameter] public bool Approved { get; set; }
+    [Parameter] public bool Compact { get; set; }
+    [Parameter] public EventCallback<string> OnMark { get; set; }
+    [Parameter] public EventCallback OnApprove { get; set; }
+
+    /// <summary>The candidate's position, picked or written, for a question without a confirmed answer.</summary>
+    [Parameter] public EventCallback<string> OnPosition { get; set; }
+
+    private string? _own;
+    private bool _saving;
+
+    private async Task Pick(string text)
+    {
+        _saving = true;
+        try
+        {
+            await OnPosition.InvokeAsync(text.Trim());
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private static string Short(string text) => text.Length <= 110 ? text : text[..110].TrimEnd() + "...";
+}

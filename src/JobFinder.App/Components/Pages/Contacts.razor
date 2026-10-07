@@ -1,0 +1,176 @@
+@page "/contacts"
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject ContactRegistry Registry
+@inject OutreachService Outreach
+@using JobFinder.Pipeline.Modules.Hiring
+
+<PageTitle>JobFinder · Контакты</PageTitle>
+<h1>Контакты и аутрич</h1>
+<Flash Message="@_flash" Error="@_error"/>
+<p class="muted small">
+    Контакты копятся сами: рекрутеры из постов в каналах, контактное лицо вакансии hh, поиск в Telegram и LinkedIn (только поиск, ≤ 10 в
+    день). Для сильных откликов (≥ 80) система предлагает, кому ещё написать, — не чаще раза в неделю на компанию. Отправка только по
+    кнопке; в LinkedIn — вы сами, по ссылке.
+</p>
+
+<h2>Аутрич</h2>
+<div class="toolbar">
+    <input type="number" placeholder="id вакансии" style="width:130px" @bind="_vacancyId"/>
+    <button disabled="@_busy" @onclick="Prepare">👤 Найти, кому написать</button>
+    <button disabled="@_busy" @onclick="ReloadAsync">Обновить черновики</button>
+</div>
+@if (_outreach.Count == 0)
+{
+    <div class="panel muted">Черновиков нет.</div>
+}
+@foreach (var o in _outreach)
+{
+    <div class="panel">
+        <div class="toolbar" style="margin:0">
+            <span class="badge @(o.Status == OutreachStatus.Sent ? "good" : o.Status == OutreachStatus.Draft ? "warn" : "")">@o.Status</span>
+            <a href="vacancies/@o.VacancyId">@o.Vacancy?.CompanyName — @o.Vacancy?.Title</a>
+            <span class="small muted">→ @o.Contact?.Kind @Value(o.Contact) @(o.Contact?.PersonName is { } p ? "· " + p : "") @(o.Contact?.Role is { } r ? "· " + r : "")</span>
+            <span style="flex:1"></span>
+            <span class="small muted">@Ui.Local(o.SentAt ?? o.CreatedAt)</span>
+        </div>
+        @if (o.Status == OutreachStatus.Draft)
+        {
+            <textarea style="min-height:80px;margin-top:8px" @bind="_texts[o.Id]"></textarea>
+            <div class="toolbar" style="margin-top:8px">
+                <button class="primary" disabled="@(_busy || o.Contact?.RetiredAt is not null)" @onclick="() => Send(o.Id)">@(o.Contact?.Kind == ContactKind.LinkedIn ? "✅ Отправил сам" : "✉️ Отправить")</button>
+                <button disabled="@_busy" @onclick="() => Skip(o.Id)">🙈 Не надо</button>
+                <span class="small muted">@(_texts.GetValueOrDefault(o.Id)?.Length ?? 0) символов@(o.Contact?.Kind == ContactKind.LinkedIn ? " (заметка к запросу ≤ 300)" : "")</span>
+            </div>
+        }
+        else
+        {
+            <div class="pre small" style="margin-top:8px">@o.Text</div>
+            @if (o.Error is not null) { <div class="small" style="color:var(--bad)">@o.Error</div> }
+        }
+    </div>
+}
+
+<h2>Реестр контактов</h2>
+<div class="panel">
+    <b>Добавить вручную</b>
+    <div class="toolbar" style="margin-top:8px">
+        <input placeholder="Компания" @bind="_company"/>
+        <select @bind="_kind">@foreach (var k in Enum.GetValues<ContactKind>()) { <option value="@k">@k</option> }</select>
+        <input placeholder="@@username / e-mail / ссылка" @bind="_value"/>
+        <input placeholder="Имя" @bind="_person"/>
+        <input placeholder="Роль" @bind="_role"/>
+        <button disabled="@_busy" @onclick="Add">Добавить</button>
+    </div>
+</div>
+<div class="toolbar">
+    <input placeholder="Фильтр по компании" @bind="_filter" @bind:event="oninput"/>
+    <span class="muted small">@_contacts.Count контактов</span>
+</div>
+<div class="table-wrap">
+    <table>
+        <thead><tr><th>Компания</th><th>Контакт</th><th>Кто</th><th>Источник</th><th class="num">Видели</th><th>Последний раз</th><th></th></tr></thead>
+        <tbody>
+        @foreach (var c in _contacts.Where(c => string.IsNullOrWhiteSpace(_filter) || (c.CompanyName ?? c.CompanyKey).Contains(_filter, StringComparison.OrdinalIgnoreCase)))
+        {
+            <tr>
+                <td>@(c.CompanyName ?? c.CompanyKey)</td>
+                <td class="small">@c.Kind · @if (c.Kind == ContactKind.LinkedIn) { <a href="@c.Value" target="_blank" rel="noopener">профиль</a> } else { <span class="mono">@c.Value</span> }</td>
+                <td class="small">@c.PersonName <span class="muted">@c.Role</span></td>
+                <td class="small muted">@c.Source @if (c.SourceRef is { } src && src.StartsWith("http", StringComparison.Ordinal)) { <a href="@src" target="_blank" rel="noopener">↗</a> }</td>
+                <td class="num">@c.SeenCount</td>
+                <td class="small">@Ui.Local(c.LastSeenAt, "dd.MM.yyyy")</td>
+                <td><button class="small-btn" title="Исключить из новых откликов, сохранив историю" disabled="@_busy" @onclick="() => Remove(c.Id)">✖</button></td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private List<Outreach> _outreach = [];
+    private List<CompanyContact> _contacts = [];
+    private Dictionary<long, string> _texts = [];
+    private Dictionary<long, OutreachEditSnapshot> _snapshots = [];
+    private Dictionary<long, ContactEditSnapshot> _contactSnapshots = [];
+    private long? _vacancyId;
+    private string _company = "", _value = "", _person = "", _role = "", _filter = "";
+    private ContactKind _kind = ContactKind.Telegram;
+    private string? _flash;
+    private bool _error;
+    private bool _busy;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        _outreach = await ctx.Outreaches.AsNoTracking().Include(o => o.Contact).Include(o => o.Vacancy)
+            .OrderBy(o => o.Status).ThenByDescending(o => o.CreatedAt).Take(60).ToListAsync();
+        _texts = _outreach.ToDictionary(o => o.Id, o => o.Text);
+        _snapshots = _outreach.Where(o => o.Contact is not null).ToDictionary(o => o.Id, o => OutreachEditSnapshot.Capture(o, o.Contact!));
+        _contacts = await ctx.CompanyContacts.AsNoTracking().Where(c => c.RetiredAt == null).OrderByDescending(c => c.LastSeenAt).Take(500).ToListAsync();
+        _contactSnapshots = _contacts.ToDictionary(contact => contact.Id, ContactEditSnapshot.Capture);
+    }
+
+    private static string Value(CompanyContact? c) => c is null ? "" : c.Kind == ContactKind.LinkedIn ? "профиль" : c.Value;
+
+    private Task Send(long id) => Act(ct => _snapshots.TryGetValue(id, out var snapshot)
+        ? Outreach.SendAsync(id, ct, _texts.GetValueOrDefault(id), snapshot)
+        : Task.FromResult(ActionResult.Fail("нет snapshot черновика; обновите страницу")));
+
+    private Task Skip(long id) => Act(ct => _snapshots.TryGetValue(id, out var snapshot)
+        ? Outreach.DismissAsync(id, ct, snapshot)
+        : Task.FromResult(ActionResult.Fail("нет snapshot черновика; обновите страницу")));
+
+    private async Task ReloadAsync()
+    {
+        await LoadAsync();
+        _flash = null;
+        _error = false;
+    }
+
+    private Task Prepare() => Act(async ct =>
+    {
+        if (_vacancyId is not { } id) return ActionResult.Fail("укажите id вакансии");
+        return await Outreach.PrepareAsync(id, ct) is null
+            ? ActionResult.Fail("контакт не найден или в компанию уже писали на этой неделе")
+            : ActionResult.Done("черновик готов (и отправлен в бот)");
+    });
+
+    private Task Add() => Act(async ct =>
+    {
+        if (string.IsNullOrWhiteSpace(_company) || string.IsNullOrWhiteSpace(_value)) return ActionResult.Fail("нужны компания и контакт");
+        if (await Registry.UpsertAsync(_company.Trim(), null, _kind, _value.Trim(), NullIfEmpty(_person), NullIfEmpty(_role), "вручную", null, ct) is null)
+            return ActionResult.Fail("контакт не распознан или ранее исключён; введённый текст сохранён");
+        _value = _person = _role = "";
+        return ActionResult.Done("добавлено");
+    });
+
+    private Task Remove(long id) => Act(ct => _contactSnapshots.TryGetValue(id, out var snapshot)
+        ? Registry.RemoveAsync(snapshot, ct)
+        : Task.FromResult(ActionResult.Fail("нет snapshot контакта; обновите реестр")));
+
+    private static string? NullIfEmpty(string s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
+
+    private async Task Act(Func<CancellationToken, Task<ActionResult>> action)
+    {
+        _busy = true;
+        try
+        {
+            var result = await action(CancellationToken.None);
+            _flash = result.Message;
+            _error = !result.Ok;
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        if (!_error) await LoadAsync();
+    }
+}

@@ -1,0 +1,166 @@
+@page "/stories"
+@using JobFinder.Pipeline.Modules.Candidate
+@using JobFinder.Core.Logging
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject StoryBank Bank
+@inject StorySources Sources
+@inject ILogger<Stories> Log
+
+<PageTitle>JobFinder · Истории</PageTitle>
+<h1>Банк историй</h1>
+<Flash Message="@_flash" Error="@_error"/>
+<p class="muted small">
+    Истории STAR + вывод — основа ответов на поведенческие вопросы и пакетов к интервью. Подтверждённые истории считаются фактами: их
+    цифры можно использовать в резюме под вакансию и письмах. Пополняйте в боте: /stories — 4 вопроса по каждому достижению (можно голосом).
+    Не разобрано достижений: <b>@_pending</b>. Удаление переносит историю в архив, сохраняя исходный текст и историю изменений.
+</p>
+
+<div class="toolbar">
+    <button class="primary" disabled="@(_saving || _editing is not null)" @onclick="New">+ Новая история</button>
+    <button disabled="@(_saving || _editing is not null)" @onclick="LoadAsync">Обновить список</button>
+    <span class="muted small">@_items.Count историй, подтверждено @_items.Count(story => story.Confirmed)</span>
+</div>
+
+@if (_editing is not null)
+{
+    <div class="panel">
+        <input disabled="@_saving" style="width:100%;font-weight:600" @bind="_editing.Title" placeholder="Название"/>
+        @foreach (var (label, get, set) in Fields(_editing))
+        {
+            <div class="small muted" style="margin-top:8px">@label</div>
+            <textarea disabled="@_saving" style="min-height:60px" value="@get()" @onchange="eventArgs => set(eventArgs.Value?.ToString() ?? string.Empty)"></textarea>
+        }
+        <div class="small muted" style="margin-top:8px">Навыки (через запятую)</div>
+        <input disabled="@_saving" style="width:100%" @bind="_skills"/>
+        <label class="small" style="display:block;margin-top:8px"><input type="checkbox" disabled="@_saving" @bind="_editing.Confirmed"/> Подтверждена (цифры можно использовать в резюме и письмах)</label>
+        <div class="toolbar" style="margin-top:8px">
+            <button class="primary" disabled="@_saving" @onclick="Save">Сохранить</button>
+            <button disabled="@_saving" @onclick="Cancel">Отмена и сброс правки</button>
+            @if (_editingId > 0) { <button disabled="@_saving" @onclick="ReloadEdit">Обновить исходную версию и сбросить правку</button> }
+        </div>
+    </div>
+}
+
+@foreach (var story in _items)
+{
+    <div class="panel">
+        <div class="toolbar" style="margin:0">
+            <b>@story.Title</b>
+            <span class="badge @(story.Confirmed ? "good" : "warn")">@(story.Confirmed ? "подтверждена" : "черновик")</span>
+            <span class="small muted">@story.Source · @Ui.Local(story.UpdatedAt, "dd.MM.yyyy")</span>
+            <span style="flex:1"></span>
+            <button disabled="@(_saving || _editing is not null)" @onclick="() => Edit(story)">✏️</button>
+            <button class="danger" disabled="@(_saving || _editing is not null)" @onclick="() => Delete(story.Id)">🗑</button>
+        </div>
+        @if (story.Achievement is not null) { <div class="small muted" style="margin-top:4px">Достижение: @story.Achievement</div> }
+        <div class="small" style="margin-top:8px">
+            <div><b>S</b> @story.Situation</div><div><b>T</b> @story.Task</div><div><b>A</b> @story.Action</div><div><b>R</b> @story.Result</div>
+            @if (!string.IsNullOrWhiteSpace(story.Reflection)) { <div><b>Вывод</b> @story.Reflection</div> }
+        </div>
+        @if (story.Skills.Count > 0) { <div class="chips" style="margin-top:6px">@foreach (var skill in story.Skills) { <span class="chip">@skill</span> }</div> }
+    </div>
+}
+
+@code {
+    private List<Story> _items = [];
+    private readonly Dictionary<long, StoryEditSnapshot> _snapshots = [];
+    private StoryContent? _editing;
+    private StoryEditSnapshot? _expected;
+    private long _editingId;
+    private Guid _creationId;
+    private bool _saving;
+    private string _skills = "";
+    private int _pending;
+    private string? _flash;
+    private bool _error;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+    private async Task LoadAsync()
+    {
+        await using var context = await Db.CreateDbContextAsync();
+        _items = await context.Stories.AsNoTracking().OrderByDescending(story => story.UpdatedAt).ToListAsync();
+        foreach (var story in _items)
+            if (_editingId != story.Id) _snapshots[story.Id] = StoryEditSnapshot.Capture(story);
+        _pending = (await Bank.PendingAsync(CancellationToken.None)).Count;
+    }
+
+    private static IEnumerable<(string Label, Func<string> Get, Action<string> Set)> Fields(StoryContent story) =>
+    [
+        ("Ситуация", () => story.Situation, value => story.Situation = value),
+        ("Задача", () => story.Task, value => story.Task = value),
+        ("Действия (лично вы)", () => story.Action, value => story.Action = value),
+        ("Результат (только проверенные цифры)", () => story.Result, value => story.Result = value),
+        ("Вывод / что сделали бы иначе", () => story.Reflection, value => story.Reflection = value),
+    ];
+
+    private void New()
+    {
+        if (_saving || _editing is not null) return;
+        _editing = new StoryContent { Source = StorySource.Resume, Confirmed = true };
+        _editingId = 0; _expected = null; _creationId = Guid.NewGuid(); _skills = "";
+    }
+
+    private void Edit(Story story)
+    {
+        if (_saving || _editing is not null || !_snapshots.TryGetValue(story.Id, out var expected)) return;
+        _editing = StoryContent.From(story); _editingId = story.Id; _expected = expected;
+        _skills = string.Join(", ", story.Skills);
+    }
+
+    private async Task Cancel()
+    {
+        if (_saving) return;
+        _editing = null; _expected = null; _editingId = 0;
+        await LoadAsync();
+    }
+
+    private async Task ReloadEdit()
+    {
+        if (_saving || _editingId == 0) return;
+        await using var context = await Db.CreateDbContextAsync();
+        var source = await context.Stories.AsNoTracking().SingleOrDefaultAsync(story => story.Id == _editingId);
+        if (source is null) { await Cancel(); return; }
+        _editing = StoryContent.From(source); _expected = StoryEditSnapshot.Capture(source); _snapshots[source.Id] = _expected;
+        _skills = string.Join(", ", source.Skills);
+    }
+
+    private async Task Save()
+    {
+        if (_editing is null || _saving) return;
+        _saving = true;
+        try
+        {
+            var content = _editing with { Skills = _skills.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList() };
+            var result = _editingId == 0 ? (await Sources.CreateAsync(content, _creationId, CancellationToken.None)).Result
+                : await Sources.SaveAsync(_expected!, content, CancellationToken.None);
+            _flash = result.Message; _error = !result.Ok;
+            if (!result.Ok) return;
+            _editing = null; _expected = null; _editingId = 0;
+            await LoadAsync();
+        }
+        catch (Exception error)
+        {
+            Log.Error("[candidate-story] failed to confirm story publication", error);
+            _flash = "Сохранение не подтверждено; текст и исходная версия сохранены."; _error = true;
+        }
+        finally { _saving = false; }
+    }
+
+    private async Task Delete(long id)
+    {
+        if (_saving || _editing is not null || !_snapshots.TryGetValue(id, out var expected)) return;
+        _saving = true;
+        try
+        {
+            var result = await Sources.RetireAsync(expected, CancellationToken.None);
+            _flash = result.Message; _error = !result.Ok;
+            if (result.Ok) await LoadAsync();
+        }
+        catch (Exception error)
+        {
+            Log.Error("[candidate-story] failed to confirm story retirement", error);
+            _flash = "Архивирование не подтверждено; исходная версия сохранена."; _error = true;
+        }
+        finally { _saving = false; }
+    }
+}

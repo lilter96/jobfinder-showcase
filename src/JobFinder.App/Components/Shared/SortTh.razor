@@ -1,0 +1,16 @@
+@* A table header that sorts by its column: the first click picks the column's natural direction (largest or newest first for numbers
+   and dates, A→Z for text), the next one reverses it. *@
+<th class="sortable @Class @(State.Key == Key ? "sorted" : "")" title="Сортировать" @onclick="Click">
+    @Title<span class="arrow">@(State.Key != Key ? "↕" : State.Desc ? "↓" : "↑")</span>
+</th>
+
+@code {
+    [Parameter, EditorRequired] public string Key { get; set; } = "";
+    [Parameter, EditorRequired] public string Title { get; set; } = "";
+    [Parameter] public string? Class { get; set; }
+    [Parameter] public bool DescFirst { get; set; }
+    [Parameter] public SortState State { get; set; }
+    [Parameter] public EventCallback<SortState> StateChanged { get; set; }
+
+    private Task Click() => StateChanged.InvokeAsync(State.Key == Key ? State with { Desc = !State.Desc } : new SortState(Key, DescFirst));
+}

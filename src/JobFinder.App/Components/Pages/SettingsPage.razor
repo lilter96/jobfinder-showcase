@@ -1,0 +1,220 @@
+@page "/settings"
+@inject RuntimeSettings Settings
+@inject JobFinder.Pipeline.Modules.Hiring.ApplicationBlocks Blocks
+@inject JobFinder.Pipeline.Profile.ProfileProvider Profiles
+
+<PageTitle>JobFinder · Настройки</PageTitle>
+<h1>Настройки</h1>
+<Flash Message="@_flash"/>
+
+<div class="grid2">
+    <div>
+        <div class="panel">
+            <b>Решения и автоотклики</b> <span class="muted small">применяются к следующей вакансии, без рестарта</span>
+            <div class="kv" style="margin-top:12px; align-items:center">
+                <div class="k">Порог автоотклика</div><div><input type="number" min="0" max="101" @bind="_auto"/> <span class="muted small">101 = никогда</span></div>
+                <div class="k">Порог одобрения</div><div><input type="number" min="0" max="100" @bind="_approval"/></div>
+                <div class="k">Автооткликов в день</div><div><input type="number" min="0" max="200" @bind="_limit"/></div>
+                <div class="k">Пауза автооткликов</div><div><input type="checkbox" @bind="_paused"/></div>
+                <div class="k">Dry-run</div><div><input type="checkbox" @bind="_dryRun"/> <span class="muted small">проверять страницу вакансии без нажатия; отклики ждут выключения и уходят сами</span></div>
+                <div class="k">Комментарии Threads</div><div><input type="checkbox" @bind="_commentsPaused"/> <span class="muted small">пауза черновиков</span></div>
+            </div>
+            <div class="toolbar" style="margin-top:12px">
+                <button class="primary" @onclick="Save">Сохранить</button>
+                @if (_conflict) { <button @onclick="ReloadPolicy">Загрузить актуальные настройки</button> }
+                @if (_blockedUntil is not null)
+                {
+                    <button @onclick="Unblock" disabled="@_blockConflict">Снять паузу после капчи (до @Ui.Local(_blockedUntil, "HH:mm"))</button>
+                }
+                @if (_blockConflict) { <button @onclick="ReloadBlock">Загрузить актуальную паузу</button> }
+            </div>
+        </div>
+
+        <EngagementPolicyEditor />
+        <SearchPolicyEditor />
+    </div>
+
+    <div>
+        <div class="panel">
+            <b>Профиль кандидата</b> <span class="muted small">в БД, применяется к следующей вакансии без рестарта</span>
+            @if (_profile is { } p)
+            {
+                @if (!p.Reviewed)
+                {
+                    <div class="flash error">Профиль создан из резюме и ещё не проверен: вакансии не оцениваются. Проверьте ожидания по зарплате,
+                        форматы и стоп-факторы (правка ниже), затем подтвердите.</div>
+                    <button class="primary" style="margin-bottom:10px" @onclick="ConfirmProfile">Профиль проверен — начать оценку</button>
+                }
+                <div class="kv small">
+                    <div class="k">Имя</div><div>@p.Name</div>
+                    <div class="k">Должность</div><div>@p.Title (@p.YearsOfExperience лет)</div>
+                    <div class="k">Английский</div><div>@p.EnglishLevel</div>
+                    <div class="k">Локация</div><div>@p.Location · @string.Join("/", p.WorkFormats)</div>
+                    <div class="k">Ожидания</div><div>@(p.DesiredSalary is { } s ? $"{s.Amount:#,0} {s.Currency} {(s.Net ? "net" : "gross")}" : "не заданы")</div>
+                    <div class="k">Навыки</div><div>@string.Join(", ", p.Skills.Select(x => x.Name))</div>
+                    <div class="k">Не рассматриваю</div><div>@string.Join("; ", p.DealBreakers)</div>
+                    <div class="k">Предпочтения</div><div>@string.Join("; ", p.Preferences)</div>
+                </div>
+                <details style="margin-top:10px" open="@(_profileError is not null)">
+                    <summary class="small">Править профиль (JSON)</summary>
+                    <textarea class="mono small" style="min-height:420px;margin-top:8px" @bind="_profileJson"></textarea>
+                    @if (_profileError is not null)
+                    {
+                        <div class="flash error">@_profileError</div>
+                    }
+                    <div class="toolbar">
+                        <button class="primary" @onclick="SaveProfile">Сохранить профиль</button>
+                        @if (_profileConflict) { <button @onclick="LoadProfileAsync">Загрузить актуальный профиль</button> }
+                    </div>
+                </details>
+            }
+            else
+            {
+                <p>Профиля нет. Положите резюме в <span class="mono">profile/resume.pdf</span> и выполните
+                    <span class="mono">dotnet run --project src/JobFinder.App -- --import-resume</span>.</p>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private int _auto, _approval, _limit;
+    private bool _paused, _dryRun, _commentsPaused;
+    private bool _conflict;
+    private JobFinder.Pipeline.Settings.PolicySnapshot<JobFinder.Pipeline.Settings.AutomationPolicy>? _policy;
+    private DateTimeOffset? _blockedUntil;
+    private JobFinder.Pipeline.Modules.Hiring.ApplicationBlockSnapshot? _block;
+    private bool _blockConflict;
+    private string? _flash;
+    private JobFinder.Core.Profile.CandidateProfile? _profile;
+    private long _profileVersion;
+    private bool _profileConflict;
+    private string? _profileJson, _profileError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await ReloadPolicy();
+        await ReloadBlock();
+        await LoadProfileAsync();
+    }
+
+    private async Task LoadProfileAsync()
+    {
+        var snapshot = await Profiles.GetSnapshotAsync(CancellationToken.None);
+        _profile = snapshot?.Value;
+        _profileVersion = snapshot?.Version ?? 0;
+        _profileJson = _profile is null ? null : JobFinder.Pipeline.Profile.ProfileProvider.ToJson(_profile);
+        _profileError = null;
+        _profileConflict = false;
+    }
+
+    /// <summary>The edited text replaces the profile only when it reads as one; the error names the line and the field.</summary>
+    private async Task SaveProfile()
+    {
+        JobFinder.Core.Profile.CandidateProfile edited;
+        try
+        {
+            edited = JobFinder.Pipeline.Profile.ProfileProvider.FromJson(_profileJson ?? "");
+        }
+        catch (System.Text.Json.JsonException e)
+        {
+            _profileError = "Не сохранено: " + e.Message;
+            return;
+        }
+
+        if (!await PublishProfileAsync(edited)) return;
+        await LoadProfileAsync();
+        _flash = "Профиль сохранён";
+    }
+
+    private async Task Save()
+    {
+        if (_policy is null) return;
+        var edited = _policy.Value with
+        {
+            AutoApplyThreshold = _auto, ApprovalThreshold = _approval, DailyAutoApplyLimit = _limit,
+            AutoApplyPaused = _paused, ApplyDryRun = _dryRun, CommentsPaused = _commentsPaused,
+        };
+        try
+        {
+            _policy = await Settings.Automation.PublishAsync(edited, _policy.Version, "dashboard", CancellationToken.None);
+            _conflict = false;
+            _flash = "Сохранено";
+        }
+        catch (JobFinder.Pipeline.Settings.PolicyConflictException)
+        {
+            _conflict = true;
+            _flash = "Настройки уже изменились. Загрузите актуальную версию перед сохранением.";
+        }
+        catch (ArgumentException error)
+        {
+            _flash = "Не сохранено: " + error.Message;
+        }
+    }
+
+    private async Task ReloadPolicy()
+    {
+        _policy = await Settings.Automation.ReadAsync(CancellationToken.None);
+        var policy = _policy.Value;
+        (_auto, _approval, _limit, _paused) = (policy.AutoApplyThreshold, policy.ApprovalThreshold, policy.DailyAutoApplyLimit, policy.AutoApplyPaused);
+        _dryRun = policy.ApplyDryRun;
+        _commentsPaused = policy.CommentsPaused;
+        _conflict = false;
+    }
+
+    private async Task ConfirmProfile()
+    {
+        if (_profile is not { } profile || !await PublishProfileAsync(profile with { Reviewed = true })) return;
+        await LoadProfileAsync();
+        _flash = "Профиль подтверждён: оценка вакансий начнётся в течение минуты";
+    }
+
+    private async Task<bool> PublishProfileAsync(JobFinder.Core.Profile.CandidateProfile profile)
+    {
+        try
+        {
+            await Profiles.SaveAsync(profile, _profileVersion, "dashboard", CancellationToken.None);
+            return true;
+        }
+        catch (JobFinder.Pipeline.Modules.Candidate.CandidateConflictException)
+        {
+            _profileConflict = true;
+            _profileError = "Профиль уже изменён. Ваш текст сохранён в редакторе; загрузите актуальную версию и согласуйте правки.";
+            _flash = _profileError;
+            return false;
+        }
+        catch (ArgumentException error)
+        {
+            _profileError = "Не сохранено: " + error.Message;
+            return false;
+        }
+    }
+
+    private async Task Unblock()
+    {
+        if (_block is null || _blockConflict) return;
+        try
+        {
+            await Blocks.ReleaseAsync(_block, "dashboard", CancellationToken.None);
+            await ReloadBlock();
+            _flash = "Пауза снята";
+        }
+        catch (JobFinder.Pipeline.Modules.Hiring.ApplicationBlockConflictException)
+        {
+            _blockConflict = true;
+            _flash = "Пауза уже изменилась. Новая блокировка не снята; загрузите её перед повтором.";
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            _blockConflict = true;
+            _flash = "Снятие паузы не подтверждено. Исходная версия сохранена; загрузите актуальную паузу перед повтором.";
+        }
+    }
+
+    private async Task ReloadBlock()
+    {
+        _block = await Blocks.ReadAsync(CancellationToken.None);
+        _blockedUntil = _block.Until;
+        _blockConflict = false;
+    }
+}

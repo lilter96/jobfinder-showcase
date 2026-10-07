@@ -1,0 +1,79 @@
+@page "/applications"
+@inject IDbContextFactory<JobFinderDbContext> Db
+
+<PageTitle>JobFinder · Отклики</PageTitle>
+<h1>Отклики</h1>
+
+<div class="toolbar">
+    <select @bind="_status" @bind:after="LoadAsync">
+        <option value="">Все</option>
+        @foreach (var s in Enum.GetValues<ApplicationStatus>())
+        {
+            <option value="@s">@Ui.AppText(s)</option>
+        }
+    </select>
+    <span class="muted small">@_items.Count показано</span>
+</div>
+
+<div class="table-wrap">
+    <table>
+        <thead><tr>
+            <SortTh Key="at" Title="Когда" DescFirst State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="vacancy" Title="Вакансия" State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="channel" Title="Канал" State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="mode" Title="Режим" State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="status" Title="Статус" State="_sort" StateChanged="SortBy"/>
+            <th>Детали</th>
+        </tr></thead>
+        <tbody>
+        @foreach (var a in _items)
+        {
+            <tr>
+                <td class="small">@Ui.Local(a.SentAt ?? a.CreatedAt)</td>
+                <td>
+                    <a href="vacancies/@a.VacancyId">@a.Vacancy?.Title</a>
+                    <div class="small muted">@a.Vacancy?.CompanyName</div>
+                </td>
+                <td class="small">@a.Channel @a.Target</td>
+                <td class="small">@Ui.ModeText(a.Mode)</td>
+                <td><span class="badge @Ui.AppCss(a.Status)">@Ui.AppText(a.Status)</span></td>
+                <td class="small muted">
+                    @a.Error
+                    @if (a.ScreenshotPath is not null) { <div class="mono">@a.ScreenshotPath</div> }
+                </td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private string _status = "";
+    private List<Application> _items = [];
+    private SortState _sort = new("at", true);
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        IQueryable<Application> q = ctx.Applications.AsNoTracking().Include(a => a.Vacancy);
+        if (Enum.TryParse<ApplicationStatus>(_status, out var s)) q = q.Where(a => a.Status == s);
+        var desc = _sort.Desc;
+        var ordered = _sort.Key switch
+        {
+            "vacancy" => desc ? q.OrderByDescending(a => a.Vacancy!.Title) : q.OrderBy(a => a.Vacancy!.Title),
+            "channel" => desc ? q.OrderByDescending(a => a.Channel) : q.OrderBy(a => a.Channel),
+            "mode" => desc ? q.OrderByDescending(a => a.Mode) : q.OrderBy(a => a.Mode),
+            "status" => desc ? q.OrderByDescending(a => a.Status) : q.OrderBy(a => a.Status),
+            _ => desc ? q.OrderByDescending(a => a.SentAt ?? a.CreatedAt) : q.OrderBy(a => a.SentAt ?? a.CreatedAt),
+        };
+        _items = await (_sort.Key == "at" ? ordered : ordered.ThenByDescending(a => a.SentAt ?? a.CreatedAt)).Take(300).ToListAsync();
+    }
+
+    private Task SortBy(SortState sort)
+    {
+        _sort = sort;
+        return LoadAsync();
+    }
+}

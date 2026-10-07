@@ -1,0 +1,167 @@
+@page "/pipeline"
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject FunnelService Funnel
+@inject ReplyService Replies
+@using JobFinder.Pipeline.Modules.Hiring
+
+<PageTitle>JobFinder · Воронка</PageTitle>
+<h1>Воронка</h1>
+<Flash Message="@_flash" Error="@_error"/>
+<button disabled="@_busy" @onclick="ReloadAsync">Обновить черновики</button>
+
+<div class="cards">
+    <div class="card"><div class="label">Отправлено</div><div class="value">@_stats.Sent</div></div>
+    <div class="card"><div class="label">Ответили</div><div class="value">@Pct(_stats.Replied)</div></div>
+    <div class="card"><div class="label">Интервью</div><div class="value">@Pct(_stats.Interviews)</div></div>
+    <div class="card"><div class="label">Офферы</div><div class="value">@_stats.Offers</div></div>
+    <div class="card"><div class="label">Отказы</div><div class="value">@_stats.Rejected</div></div>
+    <div class="card"><div class="label">Без ответа (закрыто)</div><div class="value">@_apps.Count(a => a.Stage == ApplicationStage.NoResponse)</div></div>
+</div>
+
+@if (_drafts.Count > 0)
+{
+    <h2>Ждут вашего ответа</h2>
+    @foreach (var ev in _drafts)
+    {
+        <div class="panel">
+            <div class="small muted">
+                @Ui.Local(ev.At) · @ev.Channel · @(ev.Kind == EventKind.FollowUp ? "напоминание" : "от " + ev.Author)
+                · <a href="vacancies/@ev.Application!.VacancyId">@ev.Application.Vacancy?.CompanyName — @ev.Application.Vacancy?.Title</a>
+                @if (ev.Classification is { } c) { <span class="badge">@c</span> }
+            </div>
+            @if (ev.Text is not null) { <div class="pre small" style="margin:8px 0">@ev.Text</div> }
+            <textarea style="min-height:90px" @bind="_draftText[ev.Id]"></textarea>
+            <div class="toolbar" style="margin-top:8px">
+                @if (ev.Channel is EventChannel.Telegram or EventChannel.Email)
+                {
+                    <button class="primary" disabled="@_busy" @onclick="() => SendDraft(ev.Id)">✉️ Отправить (@ev.Channel)</button>
+                }
+                else
+                {
+                    <span class="muted small">Ответ в чате hh: скопируйте текст.</span>
+                }
+                <button disabled="@_busy" @onclick="() => Dismiss(ev.Id)">🙈 Не отвечать</button>
+            </div>
+        </div>
+    }
+}
+
+<h2>Активные</h2>
+<div class="kanban">
+    @foreach (var stage in Board)
+    {
+        var column = _apps.Where(a => a.Stage == stage).OrderByDescending(a => a.StageChangedAt).ToList();
+        <div class="col">
+            <h3>@FunnelService.Label(stage) · @column.Count</h3>
+            @foreach (var a in column.Take(60))
+            {
+                <div class="item">
+                    <a href="vacancies/@a.VacancyId">@TextUtil.Truncate(a.Vacancy?.Title, 60)</a>
+                    <div class="muted">@a.Vacancy?.CompanyName</div>
+                    <div class="small muted">@Channel(a.Channel) · @Ui.Local(a.StageChangedAt ?? a.SentAt, "dd.MM") · <Score Value="a.Vacancy?.Score"/></div>
+                    <select value="@a.Stage" @onchange="e => Move(a.Id, e.Value?.ToString())">
+                        @foreach (var s in Enum.GetValues<ApplicationStage>())
+                        {
+                            <option value="@s">@FunnelService.Label(s)</option>
+                        }
+                    </select>
+                </div>
+            }
+        </div>
+    }
+</div>
+
+<h2>Закрытые</h2>
+<div class="table-wrap">
+    <table>
+        <thead><tr><th>Когда</th><th>Вакансия</th><th>Канал</th><th>Итог</th><th>Последнее событие</th></tr></thead>
+        <tbody>
+        @foreach (var a in _apps.Where(a => a.Stage is { } s && FunnelService.IsTerminal(s)).OrderByDescending(a => a.StageChangedAt).Take(100))
+        {
+            <tr>
+                <td class="small">@Ui.Local(a.StageChangedAt)</td>
+                <td><a href="vacancies/@a.VacancyId">@a.Vacancy?.Title</a><div class="small muted">@a.Vacancy?.CompanyName</div></td>
+                <td class="small">@Channel(a.Channel)</td>
+                <td><span class="badge @(a.Stage == ApplicationStage.Accepted ? "good" : a.Stage == ApplicationStage.Rejected ? "bad" : "")">@FunnelService.Label(a.Stage)</span></td>
+                <td class="small muted">@TextUtil.Truncate(_lastNote.GetValueOrDefault(a.Id), 140)</td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</div>
+
+@code {
+    private static readonly ApplicationStage[] Board =
+    [
+        ApplicationStage.Sent, ApplicationStage.Viewed, ApplicationStage.Replied, ApplicationStage.HrScreen, ApplicationStage.TechInterview,
+        ApplicationStage.Final, ApplicationStage.Offer,
+    ];
+
+    private List<Application> _apps = [];
+    private List<ApplicationEvent> _drafts = [];
+    private Dictionary<long, string> _draftText = [];
+    private Dictionary<long, ReplyEditSnapshot> _snapshots = [];
+    private Dictionary<long, string?> _lastNote = [];
+    private FunnelStats _stats;
+    private string? _flash;
+    private bool _error;
+    private bool _busy;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        _apps = await ctx.Applications.AsNoTracking().Include(a => a.Vacancy)
+            .Where(a => a.Status == ApplicationStatus.Sent && a.Stage != null).ToListAsync();
+        _stats = FunnelStats.Of(_apps);
+        _drafts = await ctx.ApplicationEvents.AsNoTracking().Include(e => e.Application).ThenInclude(a => a!.Vacancy)
+            .Where(e => e.DraftStatus == DraftStatus.Pending).OrderByDescending(e => e.At).Take(30).ToListAsync();
+        _draftText = _drafts.ToDictionary(e => e.Id, e => e.Draft ?? "");
+        _snapshots = _drafts.ToDictionary(e => e.Id, e => ReplyEditSnapshot.Capture(e, e.Application!));
+        var ids = _apps.Where(a => a.Stage is { } s && FunnelService.IsTerminal(s)).Select(a => a.Id).ToList();
+        _lastNote = (await ctx.ApplicationEvents.AsNoTracking().Where(e => ids.Contains(e.ApplicationId) && e.Text != null)
+                .GroupBy(e => e.ApplicationId).Select(g => g.OrderByDescending(e => e.At).First()).ToListAsync())
+            .ToDictionary(e => e.ApplicationId, e => e.Text);
+    }
+
+    private string Pct(int part) => _stats.Sent == 0 ? "—" : $"{part} · {100.0 * part / _stats.Sent:0}%";
+
+    private static string Channel(ApplicationChannel c) => WeeklyReportJob.ChannelLabel(c);
+
+    private Task Move(long applicationId, string? value) =>
+        Enum.TryParse<ApplicationStage>(value, out var stage) ? Act(ct => Funnel.SetStageAsync(applicationId, stage, "в дашборде", ct)) : Task.CompletedTask;
+
+    private Task SendDraft(long eventId) => Act(ct => Replies.SendReplyAsync(eventId, _draftText.GetValueOrDefault(eventId), ct,
+        expected: _snapshots[eventId]));
+
+    private Task Dismiss(long eventId) => Act(ct => Replies.DismissDraftAsync(eventId, ct, _snapshots[eventId]));
+
+    private async Task ReloadAsync()
+    {
+        await LoadAsync();
+        _flash = null;
+        _error = false;
+    }
+
+    private async Task Act(Func<CancellationToken, Task<ActionResult>> action)
+    {
+        _busy = true;
+        try
+        {
+            var result = await action(CancellationToken.None);
+            _flash = result.Message;
+            _error = !result.Ok;
+            if (result.Ok) await LoadAsync();
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+}

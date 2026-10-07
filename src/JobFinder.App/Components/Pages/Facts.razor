@@ -1,0 +1,140 @@
+@page "/facts"
+@using JobFinder.Core.Profile
+@inject JobFinder.Pipeline.Profile.FactsProvider FactsStore
+@inject RuntimeSettings Settings
+@inject HrPlaybookService Hr
+
+<PageTitle>JobFinder · Факты</PageTitle>
+<h1>Анкета фактов</h1>
+<Flash Message="@_flash" Error="@_error"/>
+<p class="muted small">
+    Так вы отвечаете на вопросы работодателей. Система отвечает сама только на рутину (интерес к вакансии, эти факты, время созвона)
+    и только по <b>подтверждённым</b> фактам. Черновики собраны из профиля: проверьте и отметьте «Подтверждаю». Пустой факт или без
+    отметки → ответ придёт вам черновиком с пометкой, чего не хватило.
+</p>
+
+<div class="toolbar">
+    <label><input type="checkbox" checked="@_autoReply" @onchange="ToggleAutoReply" disabled="@(_policy is null || _policyConflict || _policyBusy)"/> Рутинные ответы работодателям отправляются сами</label>
+    @if (_policyConflict) { <button @onclick="ReloadAutoReply">Загрузить актуальную настройку</button> }
+    <span class="muted small">(то же, что /autoreply в боте)</span>
+</div>
+
+@if (_facts is not null)
+{
+    @foreach (var f in _facts.Facts)
+    {
+        <div class="panel">
+            <div class="toolbar" style="margin:0">
+                <b>@f.Question</b>
+                <span class="badge @(f.Confirmed && !string.IsNullOrWhiteSpace(f.Answer) ? "good" : string.IsNullOrWhiteSpace(f.Answer) ? "bad" : "warn")">
+                    @(f.Confirmed && !string.IsNullOrWhiteSpace(f.Answer) ? "подтверждено" : string.IsNullOrWhiteSpace(f.Answer) ? "пусто" : "черновик")
+                </span>
+                @if (f.Source is not null) { <span class="small muted">источник: @f.Source</span> }
+            </div>
+            <textarea style="min-height:52px;margin-top:8px" placeholder="Как вы отвечаете на этот вопрос" @bind="f.Answer"></textarea>
+            <label class="small"><input type="checkbox" @bind="f.Confirmed"/> Подтверждаю: так и отвечать</label>
+        </div>
+    }
+
+    <div class="toolbar">
+        <button class="primary" @onclick="Save">Сохранить</button>
+        @if (_conflict) { <button @onclick="LoadFactsAsync">Загрузить актуальные факты</button> }
+        <span class="muted small">Хранятся в БД (документ @JobFinder.Pipeline.Profile.FactsProvider.Key)</span>
+    </div>
+}
+
+@code {
+    private CandidateFacts? _facts;
+    private long _version;
+    private bool _conflict;
+    private bool _autoReply = true;
+    private PolicySnapshot<AutomationPolicy>? _policy;
+    private bool _policyConflict, _policyBusy;
+    private string? _flash;
+    private bool _error;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadFactsAsync();
+        await ReloadAutoReply();
+    }
+
+    private async Task LoadFactsAsync()
+    {
+        var snapshot = await FactsStore.GetSnapshotAsync(CancellationToken.None);
+        _facts = snapshot.Value;
+        _version = snapshot.Version;
+        _conflict = false;
+        _flash = null;
+        _error = false;
+    }
+
+    private async Task Save()
+    {
+        if (_facts is null) return;
+        foreach (var f in _facts.Facts)
+        {
+            f.Answer = string.IsNullOrWhiteSpace(f.Answer) ? null : JobFinder.Core.Text.HumanText.Clean(f.Answer.Trim());
+            if (f.Answer is null) f.Confirmed = false;
+            if (f.Confirmed) f.Source = "вы";
+        }
+
+        try
+        {
+            var saved = await FactsStore.SaveAsync(_facts, _version, "dashboard", CancellationToken.None);
+            _facts = saved.Value;
+            _version = saved.Version;
+            _conflict = false;
+        }
+        catch (JobFinder.Pipeline.Modules.Candidate.CandidateConflictException)
+        {
+            _conflict = true;
+            _error = true;
+            _flash = "Факты уже изменены. Ваши правки остались в форме; загрузите актуальную версию перед сохранением.";
+            return;
+        }
+        catch (ArgumentException error)
+        {
+            _error = true;
+            _flash = "Не сохранено: " + error.Message;
+            return;
+        }
+        // Only the HR answers that use a changed fact are written again; the rest come from the store.
+        _ = Hr.RequestAsync(CancellationToken.None);
+        _flash = $"Сохранено: подтверждено {_facts.Facts.Count(f => f.Confirmed)} из {_facts.Facts.Count}";
+        _error = false;
+    }
+
+    private async Task ToggleAutoReply(ChangeEventArgs e)
+    {
+        if (_policy is null || _policyConflict || _policyBusy) return;
+        _autoReply = e.Value is true;
+        _policyBusy = true;
+        try
+        {
+            _policy = await Settings.Automation.PublishAsync(_policy.Value with { ChatAutoReply = _autoReply }, _policy.Version, "dashboard", CancellationToken.None);
+            _flash = _autoReply ? "Автоответы включены" : "Автоответы выключены";
+            _error = false;
+        }
+        catch (PolicyConflictException)
+        {
+            _policyConflict = true;
+            _error = true;
+            _flash = "Настройки уже изменены. Ваш выбор сохранён; загрузите актуальную настройку перед повтором.";
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            _policyConflict = true;
+            _error = true;
+            _flash = "Изменение не подтверждено. Ваш выбор сохранён; загрузите актуальную настройку перед повтором.";
+        }
+        finally { _policyBusy = false; }
+    }
+
+    private async Task ReloadAutoReply()
+    {
+        _policy = await Settings.Automation.ReadAsync(CancellationToken.None);
+        _autoReply = _policy.Value.ChatAutoReply;
+        _policyConflict = false;
+    }
+}

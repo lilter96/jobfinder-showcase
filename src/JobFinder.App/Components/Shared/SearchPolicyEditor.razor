@@ -1,0 +1,103 @@
+@using JobFinder.Core.Policies
+@using JobFinder.Pipeline.Modules.Discovery
+@inject SearchPolicyStore Policies
+
+<div class="panel">
+    <b>Поиск и фильтры</b> <span class="muted small">PostgreSQL · версия @_snapshot?.Version · без рестарта</span>
+    @if (_edited is { } edited)
+    {
+        <div class="kv small" style="margin-top:10px">
+            <div class="k">Стоп-слова</div><div><textarea @bind="_stops"></textarea></div>
+            <div class="k">Маркеры .NET</div><div><textarea @bind="_markers"></textarea></div>
+            <div class="k">Офис/гибрид</div><div><textarea @bind="_cities"></textarea></div>
+            <div class="k">Удалёнка (ISO)</div><div><textarea @bind="_countries"></textarea></div>
+            <div class="k">Английский до</div><div><select @bind="edited.Filter.MaxEnglish">
+                @foreach (var level in Enum.GetValues<JobFinder.Core.Domain.EnglishLevel>()) { <option value="@level">@level</option> }
+            </select></div>
+            <div class="k">Чёрный список</div><div><textarea @bind="_blacklist"></textarea></div>
+            <div class="k">Поиск hh</div><div><input type="checkbox" @bind="edited.HeadHunter.Enabled"/> @string.Join("; ", edited.HeadHunter.Searches.Select(search => $"{search.Name} ({search.Host})"))</div>
+            <div class="k">hh: интервал / джиттер (мин)</div><div><input type="number" min="1" @bind="edited.HeadHunter.IntervalMinutes"/> / <input type="number" min="0" @bind="edited.HeadHunter.JitterMinutes"/></div>
+            <div class="k">hh: тихие часы</div><div><input @bind="edited.HeadHunter.QuietHours"/></div>
+            <div class="k">Поиск Habr</div><div><input type="checkbox" @bind="edited.Habr.Enabled"/> <textarea @bind="_habrQueries"></textarea></div>
+            <div class="k">Поиск Threads</div><div><input type="checkbox" @bind="edited.Threads.Enabled"/> <textarea @bind="_threadsQueries"></textarea></div>
+            <div class="k">Компании: обход / время</div><div><input type="checkbox" @bind="edited.Companies.Enabled"/> <input @bind="edited.Companies.RunAt"/></div>
+        </div>
+        <p class="muted small">Один элемент на строку. Фильтры применяются к следующему посту/вакансии. Расписание обновляется за минуту; текущий проход заканчивается с исходной политикой. Паузы и бюджеты сайтов сохраняются отдельно.</p>
+        <details>
+            <summary class="small">Расширенные профили поиска</summary>
+            <textarea class="mono small" style="min-height:380px" @bind="_advanced"></textarea>
+            <button @onclick="ApplyAdvanced">Применить в форму</button>
+            <span class="muted small">Сначала применяется в форму, затем сохраняется вся политика с проверкой версии.</span>
+        </details>
+        @if (_error is not null) { <div class="flash error">@_error</div> }
+        <div class="toolbar" style="margin-top:12px">
+            <button class="primary" @onclick="Save">Сохранить поиск</button>
+            <button @onclick="Reload">Загрузить актуальную политику</button>
+        </div>
+    }
+</div>
+
+@code {
+    private SearchPolicySnapshot? _snapshot;
+    private SearchPolicy? _edited;
+    private string _stops = "", _markers = "", _cities = "", _countries = "", _blacklist = "", _habrQueries = "", _threadsQueries = "", _advanced = "";
+    private string? _error;
+
+    protected override Task OnInitializedAsync() => Reload();
+
+    private async Task Reload()
+    {
+        _snapshot = await Policies.ReadAsync(CancellationToken.None);
+        SetForm(_snapshot.Value);
+        _error = null;
+    }
+
+    private void SetForm(SearchPolicy policy)
+    {
+        _edited = SearchPolicyCompiler.Clone(policy);
+        _stops = string.Join('\n', policy.Filter.TitleStopWords);
+        _markers = string.Join('\n', policy.Filter.RequiredMarkers);
+        _cities = string.Join('\n', policy.Filter.OfficeCities);
+        _countries = string.Join('\n', policy.Filter.RemoteCountries);
+        _blacklist = string.Join('\n', policy.Filter.CompanyBlacklist);
+        _habrQueries = string.Join('\n', policy.Habr.Queries);
+        _threadsQueries = string.Join('\n', policy.Threads.VacancyQueries);
+        _advanced = System.Text.Json.JsonSerializer.Serialize(policy, new SearchPolicyJsonContext(new System.Text.Json.JsonSerializerOptions(SearchPolicyJsonContext.Default.Options) { WriteIndented = true }).SearchPolicy);
+    }
+
+    private void ApplyAdvanced()
+    {
+        try
+        {
+            var policy = System.Text.Json.JsonSerializer.Deserialize(_advanced, SearchPolicyJsonContext.Default.SearchPolicy)
+                ?? throw new System.Text.Json.JsonException("Пустая политика");
+            SearchPolicyCompiler.Validate(policy);
+            SetForm(policy);
+            _error = null;
+        }
+        catch (Exception error) when (error is System.Text.Json.JsonException or ArgumentException) { _error = "Не применено: " + error.Message; }
+    }
+
+    private async Task Save()
+    {
+        if (_snapshot is null || _edited is null) return;
+        var policy = SearchPolicyCompiler.Clone(_edited);
+        policy.Filter.TitleStopWords = Lines(_stops);
+        policy.Filter.RequiredMarkers = Lines(_markers);
+        policy.Filter.OfficeCities = Lines(_cities);
+        policy.Filter.RemoteCountries = Lines(_countries);
+        policy.Filter.CompanyBlacklist = Lines(_blacklist);
+        policy.Habr.Queries = Lines(_habrQueries);
+        policy.Threads.VacancyQueries = Lines(_threadsQueries);
+        try
+        {
+            _snapshot = await Policies.PublishAsync(policy, _snapshot.Version, "dashboard", CancellationToken.None);
+            SetForm(_snapshot.Value);
+            _error = null;
+        }
+        catch (JobFinder.Pipeline.Settings.PolicyConflictException) { _error = "Политика уже изменилась. Загрузите актуальную версию перед сохранением."; }
+        catch (Exception error) when (error is ArgumentException or System.Text.Json.JsonException) { _error = "Не сохранено: " + error.Message; }
+    }
+
+    private static List<string> Lines(string value) => value.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList();
+}

@@ -1,0 +1,19 @@
+**/bin/
+**/obj/
+.git/
+.idea/
+.vs/
+data/
+profile/
+publish/
+# Secrets are mounted at runtime (./config), never baked into the image.
+config/appsettings.Development.json
+config/appsettings.Local.json
+*.local.json
+# Not needed to build the image.
+tests/
+docs/
+.config/
+.env
+*.md
+!prompts/*.md

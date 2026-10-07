@@ -1,0 +1,108 @@
+name: jobfinder
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jobfinder
+      POSTGRES_USER: jobfinder
+      POSTGRES_PASSWORD: jobfinder
+    # Published on localhost only: the host-side CLI (--login-telegram, --import-resume, --doctor) uses it too.
+    ports: ["127.0.0.1:5433:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobfinder -d jobfinder"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      JOBFINDER_Database__ConnectionString: "Host=postgres;Port=5432;Database=jobfinder;Username=jobfinder;Password=jobfinder"
+      ASPNETCORE_URLS: "http://0.0.0.0:8080"
+      TZ: Europe/Minsk
+      # OpenTelemetry (.NET Aspire service defaults): traces, metrics and logs to the Aspire dashboard; /metrics for Prometheus.
+      OTEL_SERVICE_NAME: jobfinder
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://aspire-dashboard:18889"
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      # The host proxy (ShadowPrompter's) as the LLM's second route: taken when the direct one does not connect (the Docker network
+      # here drops TLS to OpenRouter for minutes at a time while the host gets through), and always for models with "UseProxy": true.
+      JOBFINDER_Llm__Proxy: "${JOBFINDER_LLM_PROXY:-http://host.docker.internal:8081}"
+      # The same host proxy (ShadowPrompter's) for sites the direct route cannot reach: tried after a network failure, or always for
+      # Scrape:ProxyHosts. Empty = no proxy route.
+      JOBFINDER_Scrape__Proxy: "${JOBFINDER_SCRAPE_PROXY:-http://host.docker.internal:8081}"
+    # The dashboard has no login: it is reachable from this machine only.
+    ports: ["127.0.0.1:8080:8080"]
+    volumes:
+      - ./config:/app/config:ro
+      - ./prompts:/app/prompts:ro
+      - ./profile:/app/profile
+      - ./data:/app/data
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    # Longer than the host's own shutdown budget (HostOptions.ShutdownTimeout, 20 s): a stop must reach the disposal that writes the
+    # Telegram session and updates state to the database. Without it the engine kills the app 3 s after SIGTERM, mid-shutdown.
+    stop_grace_period: 30s
+    # Chromium needs more than the default 64 MB of /dev/shm.
+    shm_size: "1gb"
+
+  # .NET Aspire dashboard: traces (every stage with its duration, LLM calls with model, tokens and cost), structured logs and metrics,
+  # in memory (a restart empties it; Prometheus keeps the metrics). No login: reachable from this machine only.
+  aspire-dashboard:
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:latest
+    restart: unless-stopped
+    environment:
+      DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS: "true"
+      ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL: "http://0.0.0.0:18889"
+    ports: ["127.0.0.1:18888:18888"]
+
+  # Prometheus: scrapes the app's /metrics every 15 s and keeps 30 days (LLM spend and latency by model, job runs, stage durations).
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d"]
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+
+  # A dump of the database at start and then daily, kept for BACKUP_KEEP_DAYS. The folder should be on another physical disk than
+  # Docker's disk image (set JOBFINDER_BACKUP_DIR in .env, e.g. D:/Backups/jobfinder): a dead disk must not take the copy with it.
+  # Restore: pg_restore --clean --if-exists -h 127.0.0.1 -p 5433 -U jobfinder -d jobfinder <file>.dump
+  backup:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: jobfinder
+      PGPASSWORD: jobfinder
+      PGDATABASE: jobfinder
+      BACKUP_KEEP_DAYS: "14"
+      TZ: Europe/Minsk
+    volumes:
+      - ${JOBFINDER_BACKUP_DIR:-./data/backups}:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          f=/backups/jobfinder-$$(date +%Y%m%d-%H%M).dump
+          if pg_dump -Fc -f "$$f.part" && mv "$$f.part" "$$f"; then
+            echo "backup: $$f ($$(du -h "$$f" | cut -f1))"
+            find /backups -name 'jobfinder-*.dump' -mtime +$$BACKUP_KEEP_DAYS -delete
+          else
+            echo "backup FAILED"; rm -f "$$f.part"
+          fi
+          sleep 86400
+        done
+
+volumes:
+  pgdata:
+  prometheus:

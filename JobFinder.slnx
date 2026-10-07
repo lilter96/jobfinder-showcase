@@ -1,0 +1,16 @@
+<Solution>
+    <Folder Name="/src/">
+        <Project Path="src/JobFinder.Core/JobFinder.Core.csproj" />
+        <Project Path="src/JobFinder.Data/JobFinder.Data.csproj" />
+        <Project Path="src/JobFinder.Llm/JobFinder.Llm.csproj" />
+        <Project Path="src/JobFinder.Integrations/JobFinder.Integrations.csproj" />
+        <Project Path="src/JobFinder.Pipeline/JobFinder.Pipeline.csproj" />
+        <Project Path="src/JobFinder.Bot/JobFinder.Bot.csproj" />
+        <Project Path="src/JobFinder.App/JobFinder.App.csproj" />
+        <Project Path="src/JobFinder.ServiceDefaults/JobFinder.ServiceDefaults.csproj" />
+    </Folder>
+    <Folder Name="/tests/">
+        <Project Path="tests/JobFinder.MessagingProbe/JobFinder.MessagingProbe.csproj" />
+        <Project Path="tests/JobFinder.Tests/JobFinder.Tests.csproj" />
+    </Folder>
+</Solution>

@@ -1,0 +1,656 @@
+@page "/vacancies/{Id:long}"
+@using JobFinder.Pipeline.Modules.Hiring
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject ApprovalService Approvals
+@inject JobFinder.Pipeline.Documents.ResumeTailor Tailor
+@inject FunnelService Funnel
+@inject OutreachService Outreach
+@inject ContactRegistry Contacts
+@inject RecruiterChatService Chats
+@inject RejectionReviewService Rejections
+
+<PageTitle>JobFinder · @(_v?.Title ?? "Вакансия")</PageTitle>
+
+@if (_v is null)
+{
+    <p class="muted">@(_loaded ? "Вакансия не найдена." : "Загрузка…")</p>
+    return;
+}
+
+<h1><Score Value="_v.Score"/> @_v.Title</h1>
+<Flash Message="@_flash" Error="@_error"/>
+
+<div class="grid2">
+    <div>
+        <div class="panel">
+            <div class="kv">
+                <div class="k">Компания</div><div>@(_v.CompanyName ?? "—") @if (_v.Company?.Industries.Count > 0) { <span class="muted small">· @string.Join(", ", _v.Company.Industries)</span> }</div>
+                <div class="k">Где / формат</div><div>@_v.City @_v.CountryCode · @Cards.Formats(_v.WorkFormats)</div>
+                <div class="k">Зарплата</div><div>@(Cards.Salary(_v) is { Length: > 0 } salary ? salary : "—") <span class="muted small">@_v.Evaluation?.SalaryNote</span></div>
+                <div class="k">Английский</div><div>@Ui.EnglishText(_v.EnglishRequired)</div>
+                <div class="k">Опыт</div><div>@Ui.ExperienceText(_v.Experience)</div>
+                <div class="k">Навыки</div><div class="small">@string.Join(", ", _v.Skills)</div>
+                @if (_v.Contacts.Count > 0)
+                {
+                    <div class="k">Контакты</div>
+                    <div class="small">
+                        @foreach (var c in _v.Contacts)
+                        {
+                            <div>
+                                @Ui.ContactIcon(c.Kind)
+                                @if (Ui.ContactHref(c) is { } href) { <a href="@href" target="_blank" rel="noopener">@Ui.ContactText(c)</a> } else { <span>@Ui.ContactText(c)</span> }
+                                @if (Ui.ContactNote(c) is { } note) { <span class="muted"> · @note</span> }
+                                @if (c.Source is { } source) { <span class="muted"> · <a href="@source" target="_blank" rel="noopener">со страницы</a></span> }
+                            </div>
+                        }
+                    </div>
+                }
+                <div class="k">Статус</div>
+                <div>
+                    <span class="badge @Ui.StatusCss(_v.Status)">@Ui.StatusText(_v.Status)</span>
+                    @* The scoring decision matters only while the vacancy waits for one: after a response it is history. *@
+                    @if (_v.Status == VacancyStatus.Scored) { <span class="small muted"> · @Ui.DecisionText(_v.Decision)</span> }
+                    @if (_v.RejectReason is not null) { <span class="muted small"> — @_v.RejectReason</span> }
+                    @if (_v.LastError is not null) { <div class="small" style="color:var(--bad)">@_v.LastError</div> }
+                </div>
+                <div class="k">Ссылка</div><div><a href="@_v.Url" target="_blank" rel="noopener">@_v.Url</a></div>
+            </div>
+        </div>
+
+        @if (_v.Evaluation is { } e)
+        {
+            <div class="panel">
+                <b>Оценка</b> <span class="muted small">LLM @_v.LlmScore, зарплата @_v.SalaryAdjustment.ToString("+0;-0;0", CultureInfo.InvariantCulture) · стек @e.StackMatch · грейд @e.SeniorityMatch · домен @e.DomainMatch · формат @e.FormatMatch · @e.Model</span>
+                <p>@e.Summary</p>
+                @if (e.Strengths.Count > 0) { <div>✅ Сильные стороны<ul class="tight">@foreach (var x in e.Strengths) { <li>@x</li> }</ul></div> }
+                @if (e.Gaps.Count > 0) { <div>⚠️ Пробелы<ul class="tight">@foreach (var x in e.Gaps) { <li>@x</li> }</ul></div> }
+                @if (e.RedFlags.Count > 0) { <div>🚩 Тревожные признаки<ul class="tight">@foreach (var x in e.RedFlags) { <li>@x</li> }</ul></div> }
+                <div class="kv" style="margin-top:8px">
+                    <div class="k">Легитимность</div>
+                    <div>
+                        <span class="badge @(_v.Legitimacy switch { Legitimacy.Ok => "good", Legitimacy.Suspicious => "warn", Legitimacy.Scam => "bad", _ => "" })">@LegitimacyText(_v.Legitimacy)</span>
+                        @if (e.LegitimacyReasons.Count > 0) { <span class="small muted"> — @string.Join("; ", e.LegitimacyReasons)</span> }
+                    </div>
+                    @if (e.MarketNote is not null) { <div class="k">Рынок</div><div class="small">@e.MarketNote</div> }
+                    @if (_v.ResponsesCount is { } responses) { <div class="k">Откликов на hh</div><div class="small">@responses</div> }
+                    @if (_v.OriginalPostedAt is { } posted) { <div class="k">Впервые опубликована</div><div class="small">@Ui.Local(posted, "dd.MM.yyyy")</div> }
+                    <div class="k">Язык</div><div class="small">@e.Language</div>
+                </div>
+                @if (e.Keywords.Count > 0)
+                {
+                    <div class="small muted" style="margin-top:8px">ATS-ключи вакансии</div>
+                    <div class="chips">@foreach (var k in e.Keywords) { <span class="chip @(_resume is null ? "" : _resume.KeywordsCovered.Contains(k) ? "ok" : "miss")">@k</span> }</div>
+                }
+            </div>
+        }
+
+        <div class="panel">
+            <b>Описание</b>
+            <div class="pre small" style="margin-top:8px">@_v.Description</div>
+        </div>
+    </div>
+
+    <div>
+        @* What can be done now depends on the response: none yet, queued, waiting for the user on the site, or sent and in the funnel. *@
+        <div class="panel">
+            @if (Live is { Status: ApplicationStatus.Sent } sent)
+            {
+                <b>✅ Отклик отправлен</b>
+                <div class="small muted" style="margin-top:4px">
+                    @Ui.Local(sent.SentAt ?? sent.CreatedAt) · @WeeklyReportJob.ChannelLabel(sent.Channel) · @Ui.ModeText(sent.Mode)
+                </div>
+                <div class="toolbar" style="margin-top:10px">
+                    <span class="small">Стадия</span>
+                    <select value="@sent.Stage" disabled="@_busy" @onchange="e => Move(sent.Id, e.Value?.ToString())">
+                        @foreach (var st in Enum.GetValues<ApplicationStage>()) { <option value="@st">@FunnelService.Label(st)</option> }
+                    </select>
+                </div>
+                @if (_facts is { } f)
+                {
+                    <div class="small" style="margin-top:10px">
+                        @if (f.Covered.Count + f.Missing.Count > 0)
+                        {
+                            <div>ATS: в резюме <b>@f.Covered.Count из @(f.Covered.Count + f.Missing.Count)</b> ключей вакансии
+                                @if (f.Missing.Count > 0) { <span class="muted">· нет: @string.Join(", ", f.Missing)</span> }
+                            </div>
+                        }
+                        @if (f.Outcome == JobFinder.Core.Filtering.ResponseOutcome.Rejected)
+                        {
+                            <div style="margin-top:6px"><b>Почему могли отказать</b>@(f.DaysToOutcome is { } d ? $" · отказ через {d:0.#} дн." : "")</div>
+                            @if (f.Suspects() is { Count: > 0 } suspects)
+                            {
+                                <ul class="tight">@foreach (var s in suspects) { <li>@s</li> }</ul>
+                            }
+                            else
+                            {
+                                <div class="muted">По вакансии явных причин нет: скорее конкуренция или причины компании.</div>
+                            }
+                            <a href="analytics">Общий разбор отказов</a>
+                        }
+                    </div>
+                }
+                @if (sent.Events.Any(e => e.DraftStatus == DraftStatus.Pending))
+                {
+                    <div class="small" style="margin-top:8px">💬 Работодатель ждёт ответа: черновик в боте и на странице <a href="pipeline">«Воронка»</a></div>
+                }
+                <div class="toolbar" style="margin-top:10px">
+                    @if (sent.Channel == ApplicationChannel.HeadHunter || sent.Mode == ApplicationMode.External)
+                    {
+                        <a class="btn" href="https://rabota.by/applicant/negotiations" target="_blank" rel="noopener">💬 Чаты hh</a>
+                    }
+                </div>
+            }
+            else if (Live is { Status: ApplicationStatus.Pending or ApplicationStatus.Sending } queued)
+            {
+                <b>⏳ Отклик в очереди</b>
+                <div class="small muted" style="margin-top:4px">@WeeklyReportJob.ChannelLabel(queued.Channel) · @Ui.ModeText(queued.Mode) · с @Ui.Local(queued.CreatedAt)</div>
+            }
+            else if (Live is { Status: ApplicationStatus.OutcomeUnknown } uncertain)
+            {
+                <b>⚠️ Доставка требует сверки</b>
+                <div class="small" style="margin-top:4px">@uncertain.Error</div>
+                <div class="small muted">Автоматический повтор остановлен. Проверьте переписку или отклики на площадке.</div>
+                <div class="toolbar" style="margin-top:10px">
+                    <a class="btn" href="@_v.Url" target="_blank" rel="noopener">Открыть вакансию</a>
+                    <button disabled="@_busy" @onclick="Manual">✅ Нашёл отправленный отклик</button>
+                </div>
+            }
+            else if (Live is { Status: ApplicationStatus.DryRun } held)
+            {
+                <b>🧪 Проверен в dry-run, не отправлен</b>
+                <div class="small muted" style="margin-top:4px">Уйдёт сам после выключения dry-run (если прошло не больше @JobFinder.Pipeline.Workers.ApplyWorker.DryRunHoldDays дн.) · проверен @Ui.Local(held.CreatedAt)</div>
+                <div class="toolbar" style="margin-top:10px">
+                    <a class="btn" href="@_v.Url" target="_blank" rel="noopener">Открыть вакансию</a>
+                    <button class="primary" disabled="@_busy" @onclick="Manual">✅ Откликнулся сам</button>
+                    <button class="danger" disabled="@_busy" @onclick="Dismiss">🙈 Пропустить</button>
+                </div>
+            }
+            else if (Live is { Status: ApplicationStatus.NeedsManual } manual)
+            {
+                <b>✋ Нужно закончить отклик на сайте</b>
+                @if (manual.Error is not null) { <div class="small" style="margin-top:4px">@manual.Error</div> }
+                <div class="toolbar" style="margin-top:10px">
+                    <a class="btn" href="@_v.Url" target="_blank" rel="noopener">Открыть вакансию</a>
+                    <button class="primary" disabled="@_busy" @onclick="Manual">✅ Откликнулся сам</button>
+                    <button class="danger" disabled="@_busy" @onclick="Dismiss">🙈 Пропустить</button>
+                </div>
+            }
+            else
+            {
+                <b>Действия</b>
+                @if (_v.Status == VacancyStatus.Dismissed) { <div class="small muted" style="margin-top:4px">Вы пропустили эту вакансию; откликнуться всё ещё можно.</div> }
+                <div class="toolbar" style="margin-top:10px">
+                    <button class="primary" disabled="@_busy" @onclick="Apply">🚀 Откликнуться</button>
+                    <button disabled="@_busy" @onclick="Manual">✅ Откликнулся сам</button>
+                    @if (_v.Status is not (VacancyStatus.Dismissed or VacancyStatus.Rejected)) { <button class="danger" disabled="@_busy" @onclick="Dismiss">🙈 Пропустить</button> }
+                    <button disabled="@_busy" @onclick="Rescore">🔁 Переоценить</button>
+                </div>
+                @if (TgContacts.Count > 0)
+                {
+                    <div class="small muted" style="margin-top:6px">Или напишите рекрутеру в Telegram ниже: сообщение с резюме станет откликом.</div>
+                }
+            }
+        </div>
+
+        @RecruiterPanel
+
+        <div class="panel">
+            <div class="toolbar" style="margin:0">
+                <b>Резюме под вакансию</b>
+                <span style="flex:1"></span>
+                <button disabled="@_busy" @onclick="Tailor_">@(_busy ? "Собираю…" : _resume is null ? "📄 Собрать" : "🔄 Пересобрать")</button>
+            </div>
+            @if (_resume is not null)
+            {
+                var total = _resume.KeywordsCovered.Count + _resume.KeywordsMissing.Count;
+                @if (_report is null || !JobFinder.Pipeline.Documents.ResumeTailor.Ready(_report))
+                {
+                    <div class="small">⚠️ Резюме пока нельзя отправлять: проверка качества или PDF не пройдена.</div>
+                }
+                <div style="margin-top:8px"><a href="files/resume/@_resume.Id" target="_blank">⬇️ @_resume.FileName</a></div>
+                <div class="small muted">@_resume.Language · @Ui.Local(_resume.CreatedAt) · @_resume.Model · $@_resume.CostUsd.ToString("0.####", CultureInfo.InvariantCulture)</div>
+                @if (_report?.Review is { } review)
+                {
+                    <div class="small" style="margin-top:6px">Рецензия рекрутера: <span class="badge @(review.Score >= 8 ? "good" : review.Score >= 6 ? "warn" : "bad")">@review.Score/10</span> @review.Verdict</div>
+                    @if (review.Checks.Count > 0)
+                    {
+                        <div class="small" style="margin-top:4px">@foreach (var c in review.Checks) { <span class="chip @(c.Passed ? "ok" : "miss")" title="@c.Note">@c.Id</span> }</div>
+                    }
+                    @if (review.Issues.Count > 0)
+                    {
+                        <details style="margin-top:4px"><summary class="small">Замечания: @review.Issues.Count</summary>
+                            <ul class="tight small">@foreach (var i in review.Issues) { <li><b>@i.Where:</b> @i.Problem → @i.Fix</li> }</ul>
+                        </details>
+                    }
+                }
+                @if (_report is { } report)
+                {
+                    <div class="small @(report.Layout.Count == 0 ? "muted" : "")" style="margin-top:4px">
+                        Страниц: @report.Pages · вёрстка: @(report.Layout.Count == 0 ? "проверена, разрывов нет" : string.Join("; ", report.Layout))
+                    </div>
+                }
+                @if (total > 0) { <div class="small" style="margin-top:6px">Покрытие ключей: <b>@_resume.KeywordsCovered.Count / @total</b></div> }
+                @if (_report?.Unshown.Count > 0) { <div class="small">Есть в опыте, но не словами вакансии: @string.Join(", ", _report.Unshown)</div> }
+                @if (_resume.KeywordsMissing.Count > 0) { <div class="small muted">Нет в опыте (в резюме не пишутся): @string.Join(", ", _resume.KeywordsMissing)</div> }
+                @if (_report?.Requirements.Count > 0)
+                {
+                    <details style="margin-top:6px"><summary class="small">План: требования вакансии и чем они закрыты</summary>
+                        <ul class="tight small">@foreach (var r in _report.Requirements)
+                        {
+                            <li>@(r.MustHave ? "❗" : "") @r.Requirement — @(string.IsNullOrWhiteSpace(r.Evidence) ? "нет в опыте" : r.Placement)</li>
+                        }</ul>
+                    </details>
+                }
+                @if (_resume.Corrections.Count > 0)
+                {
+                    <details style="margin-top:6px"><summary class="small">Проверка фактов исправила: @_resume.Corrections.Count</summary>
+                        <ul class="tight small">@foreach (var c in _resume.Corrections) { <li>@c</li> }</ul>
+                    </details>
+                }
+            }
+            else
+            {
+                <div class="small muted" style="margin-top:6px">Собирается автоматически для вакансий ≥ 60; прикладывается к ЛС и письмам.</div>
+            }
+        </div>
+
+        @if (Live is { Status: ApplicationStatus.Sent }) { @History }
+
+        @if (Live is { Status: ApplicationStatus.Sending or ApplicationStatus.OutcomeUnknown } withLetter)
+        {
+            <div class="panel">
+                <div class="small muted">@(withLetter.Status == ApplicationStatus.OutcomeUnknown ? "Точный текст попытки: сначала нужно сверить доставку." : "Отправка уже началась: редактирование заблокировано.")</div>
+                @if (withLetter.CoverLetter is { Length: > 0 } letter)
+                {
+                    <b>Письмо</b> <span class="muted small">· текст сохранённой попытки</span>
+                    <div class="pre small" style="margin-top:8px">@letter</div>
+                }
+                else
+                {
+                    <b>Письмо</b> <span class="muted small">· в сохранённой попытке письмо отсутствует</span>
+                }
+            </div>
+        }
+        else if (Live is not { Status: ApplicationStatus.Sent })
+        {
+            <div class="panel">
+                <b>Письмо</b>
+                @if (Live is { Status: ApplicationStatus.Pending })
+                {
+                    <div class="small muted">Замена обновит отклик в очереди; новое письмо снова пройдёт проверку перед отправкой.</div>
+                }
+                @if (_v.LetterReview is { } letterReview && letterReview.TextHash == JobFinder.Pipeline.Career.Fingerprint.Of(JobFinder.Core.Text.HumanText.Clean(_letter)))
+                {
+                    <div class="small muted">Проверка: @letterReview.Score/10</div>
+                    @if (letterReview.Problems.Count > 0)
+                    {
+                        <div class="small">⚠️ Отправка заблокирована: @string.Join("; ", letterReview.Problems)</div>
+                    }
+                }
+                else
+                {
+                    <div class="small muted">Перед отправкой письмо пройдёт проверку.</div>
+                }
+                <textarea @bind="_letter" style="margin-top:8px"></textarea>
+                <div class="toolbar" style="margin-top:8px">
+                    <button disabled="@_busy" @onclick="SaveLetter">Сохранить</button>
+                    @if (_letterConflict)
+                    {
+                        <button disabled="@_busy" @onclick="ReloadLetter">Загрузить актуальное письмо</button>
+                        <span class="muted small">Ваш текст сохранён в редакторе, но не отправлен. Загрузка заменит его актуальной версией.</span>
+                    }
+                    <button disabled="@_busy" @onclick="Regenerate">🔄 Сгенерировать заново</button>
+                    <span class="muted small">@(_letter?.Length ?? 0) символов</span>
+                </div>
+            </div>
+        }
+
+        <div class="panel">
+            <b>Источники</b>
+            <ul class="tight">
+                @foreach (var s in _v.Sources)
+                {
+                    <li><a href="@s.Url" target="_blank" rel="noopener">@s.Source</a> <span class="muted small">@s.Host · @Ui.Local(s.FetchedAt)@(s.HasEmployerTest ? " · тест работодателя" : "")@(s.LetterRequired ? " · письмо обязательно" : "")</span></li>
+                }
+            </ul>
+        </div>
+
+
+        @if (Live is not { Status: ApplicationStatus.Sent } && _v.Applications.Count > 0) { @History }
+    </div>
+</div>
+
+@code {
+    [Parameter] public long Id { get; set; }
+
+    private Vacancy? _v;
+    private List<CompanyContact> _people = [];
+    private Dictionary<long, ContactEditSnapshot> _contactSnapshots = [];
+    private string? _recruiter;
+    private bool _loaded;
+    private string? _letter;
+    private JobFinder.Pipeline.Modules.Hiring.LetterEditSnapshot? _letterSnapshot;
+    private bool _letterConflict;
+    private string? _flash;
+    private bool _error;
+    private bool _busy;
+
+    protected override Task OnParametersSetAsync() => LoadAsync();
+
+    private async Task LoadAsync(bool preserveLetter = false)
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        _v = await ctx.Vacancies.AsNoTracking().Include(v => v.Sources).Include(v => v.Applications).ThenInclude(a => a.Events).Include(v => v.Company)
+            .FirstOrDefaultAsync(v => v.Id == Id);
+        _resume = await ctx.TailoredResumes.AsNoTracking().Where(t => t.VacancyId == Id).OrderByDescending(t => t.Id).FirstOrDefaultAsync();
+        _report = _resume?.ReportJson is { } json
+            ? System.Text.Json.JsonSerializer.Deserialize(json, JobFinder.Core.Resume.ResumeJsonContext.Default.ResumeReport)
+            : null;
+        _people = await Contacts.ForCompanyAsync(_v?.CompanyName, CancellationToken.None);
+        _contactSnapshots = _people.ToDictionary(contact => contact.Id, ContactEditSnapshot.Capture);
+        if (!preserveLetter)
+        {
+            _letter = Live is { Status: ApplicationStatus.Pending or ApplicationStatus.DryRun } pending ? pending.CoverLetter ?? _v?.CoverLetter : _v?.CoverLetter;
+            _letterSnapshot = _v is null ? null : JobFinder.Pipeline.Modules.Hiring.LetterEditSnapshot.Capture(_v);
+            _letterConflict = false;
+        }
+        _facts = null;
+        if (Live is { Status: ApplicationStatus.Sent } sent && _v is not null)
+        {
+            sent.Vacancy ??= _v;
+            _facts = RejectionReviewService.Facts(sent, await Rejections.ResumeTextAsync(CancellationToken.None), DateTimeOffset.UtcNow);
+        }
+
+        _situation = RecruiterChatService.Situation(Live);
+        // The box keeps what the user typed across reloads; the mode and the attachment follow the situation until they write something.
+        if (string.IsNullOrWhiteSpace(_dm))
+        {
+            _fresh = _situation != RecruiterSituation.NotApplied && RecruiterChatService.FreshByDefault(_situation);
+            _attach = _fresh || RecruiterChatService.AttachByDefault(_situation);
+        }
+
+        _loaded = true;
+    }
+
+    private TailoredResume? _resume;
+    private JobFinder.Core.Resume.ResumeReport? _report;
+    private JobFinder.Core.Filtering.ResponseFacts? _facts;
+
+    private Task Tailor_() => Act(async ct =>
+    {
+        var r = await Tailor.GetOrCreateAsync(Id, ct, force: _resume is not null);
+        return ActionResult.Done($"резюме готово: {r.FileName}" + (r.Corrections.Count > 0 ? $", исправлений: {r.Corrections.Count}" : ""));
+    });
+
+    private Task Move(long applicationId, string? value) =>
+        Enum.TryParse<ApplicationStage>(value, out var stage) ? Act(ct => Funnel.SetStageAsync(applicationId, stage, "в дашборде", ct)) : Task.CompletedTask;
+
+    // ---- the recruiter in Telegram ----
+
+    private long? _tgId;
+    private string? _dm;
+    private bool _attach;
+    private bool _fresh;
+    private RecruiterSituation _situation;
+
+    /// <summary>The last generated draft: while the box still holds it, switching the mode rewrites it.</summary>
+    private string? _lastDraft;
+
+    private IReadOnlyList<RecruiterEvidence> _draftEvidence = [];
+    private IReadOnlyList<string> _draftProblems = [];
+
+    private List<CompanyContact> TgContacts => _people.Where(c => c.Kind == ContactKind.Telegram).ToList();
+
+    private CompanyContact? Tg => TgContacts.FirstOrDefault(c => c.Id == _tgId) ?? TgContacts.FirstOrDefault();
+
+    private List<ApplicationEvent> TgMessages => (_v?.Applications ?? []).SelectMany(a => a.Events).Where(RecruiterChatService.IsTelegramMessage)
+        .OrderBy(e => e.At).ToList();
+
+    /// <summary>Contacts, the chat with the chosen recruiter, and a message box with a draft for where the response stands.</summary>
+    private RenderFragment RecruiterPanel => @<text>
+        <div class="panel">
+            <div class="toolbar" style="margin:0">
+                <b>✈️ Рекрутер в Telegram</b>
+                <span style="flex:1"></span>
+                <button class="small-btn" disabled="@_busy" @onclick="ReloadContacts">Обновить контакты</button>
+                @if (TgContacts.Count > 0)
+                {
+                    <button class="small-btn" disabled="@_busy" title="Перенести переписку с рекрутером (и то, что вы писали с телефона) в историю отклика" @onclick="SyncChat">🔄 Переписка</button>
+                }
+            </div>
+            <div class="small" style="margin-top:6px">
+                @foreach (var c in _people)
+                {
+                    <div class="contact-row">
+                        @if (c.Kind == ContactKind.Telegram)
+                        {
+                            <input type="radio" name="tg" checked="@(c.Id == Tg?.Id)" @onchange="() => _tgId = c.Id"/>
+                            <a href="@("https://t.me/" + c.Value.TrimStart('@'))" target="_blank" rel="noopener">@c.Value</a>
+                        }
+                        else if (c.Kind == ContactKind.LinkedIn) { <a href="@c.Value" target="_blank" rel="noopener">LinkedIn</a> }
+                        else { <span class="mono">@c.Value</span> }
+                        @if (c.PersonName is { } p) { <span>· @p</span> }
+                        <span class="muted">· @(c.Role ?? c.Source)</span>
+                        <button class="small-btn" title="Отвязать контакт от компании" disabled="@_busy" @onclick="() => RemoveContact(c.Id)">✖</button>
+                    </div>
+                }
+                @if (_people.Count == 0) { <div class="muted">У компании пока нет контактов.</div> }
+                <div class="toolbar" style="margin:6px 0 0">
+                    <input placeholder="@@username, t.me/…, e-mail или LinkedIn" style="flex:1;min-width:200px" @bind="_recruiter"/>
+                    <button class="small-btn" disabled="@(_busy || string.IsNullOrWhiteSpace(_recruiter))" @onclick="LinkRecruiter">Привязать</button>
+                    <button class="small-btn" disabled="@_busy" title="Поиск HR компании в Telegram и LinkedIn (≤ 10 в день)" @onclick="FindPeople">🔎 Найти в компании</button>
+                </div>
+            </div>
+            @if (Tg is { } tg)
+            {
+                var messages = TgMessages;
+                @if (messages.Count > 0)
+                {
+                    <div class="chat">
+                        @foreach (var m in messages)
+                        {
+                            <div class="bubble @(m.Kind == EventKind.MessageOut ? "mine" : "theirs")">@m.Text<div class="meta">@(m.Kind == EventKind.MessageOut ? "я" : m.Author) · @Ui.Local(m.At)</div></div>
+                        }
+                    </div>
+                }
+                else
+                {
+                    <div class="small muted" style="margin:8px 0">Переписки с @tg.Value здесь ещё нет. Если вы уже писали с телефона, нажмите «🔄 Переписка».</div>
+                }
+                @if (_situation != RecruiterSituation.NotApplied)
+                {
+                    <label class="small" style="display:block;margin-top:4px" title="Модель не получает ни прошлый отклик, ни переписку по нему: упомянуть их нечем. Резюме прикладывается.">
+                        <input type="checkbox" checked="@_fresh" disabled="@_busy" @onchange="ToggleFresh"/>
+                        <b>🧼 С чистого листа</b>: как новый отклик, без упоминания прошлого отклика@(_situation == RecruiterSituation.Rejected ? " и отказа" : "")
+                    </label>
+                }
+                <div class="small muted">@(_fresh ? "Режим: " + RecruiterChatService.FreshLabel : "Ситуация: " + RecruiterChatService.Label(_situation))</div>
+                @if (_situation == RecruiterSituation.Nudge && Live?.LastOutboundAt is { } lastOut && DateTimeOffset.UtcNow - lastOut < RecruiterChatService.NudgeAfter)
+                {
+                    <div class="small" style="color:var(--warn)">Вы писали @Ui.Local(lastOut): напоминать обычно стоит через 2-3 рабочих дня, раньше это выглядит как давление.</div>
+                }
+                @if (RecruiterChatService.IsClosed(Live))
+                {
+                    <div class="small muted">Прошлый отклик закрыт (@FunnelService.Label(Live!.Stage)): отправка начнёт новую попытку в воронке, старая история останется отдельно.</div>
+                }
+                <textarea style="margin-top:6px;min-height:120px" placeholder="@($"Сообщение {tg.Value}…")" @bind="_dm" @bind:event="oninput"></textarea>
+                @if (_draftProblems.Count > 0 && _dm == _lastDraft)
+                {
+                    <div class="check-box">⚠️ Черновик не прошёл проверку, поправьте руками или «✨ Черновик» ещё раз:
+                        <ul class="tight">@foreach (var p in _draftProblems) { <li>@p</li> }</ul>
+                    </div>
+                }
+                @if (_draftEvidence.Count > 0 && _dm == _lastDraft)
+                {
+                    <details class="small" style="margin-top:4px">
+                        <summary class="muted">На что опирается черновик (@_draftEvidence.Count)</summary>
+                        @foreach (var e in _draftEvidence)
+                        {
+                            <div style="margin:4px 0 0 12px">@(e.Found ? "✔" : "⚠️") @e.Fact<div class="muted">«@e.Quote»@(e.Found ? "" : " — этой цитаты нет в профиле")</div></div>
+                        }
+                    </details>
+                }
+                <div class="toolbar" style="margin-top:6px">
+                    <button disabled="@_busy" @onclick="DraftDm">@(_busy ? "Пишу и проверяю…" : "✨ Черновик")</button>
+                    <label class="small"><input type="checkbox" @bind="_attach"/> 📎 резюме под вакансию@(_resume is null ? "" : $" ({_resume.FileName})")</label>
+                    <span style="flex:1"></span>
+                    <span class="small muted">@(_dm?.Length ?? 0) символов</span>
+                    <button class="primary" disabled="@(_busy || string.IsNullOrWhiteSpace(_dm))" @onclick="SendDm">✈️ Отправить</button>
+                </div>
+                <div class="small muted">Уходит с вашего аккаунта только по кнопке. Ответы рекрутера попадут сюда и в воронку.</div>
+            }
+        </div>
+    </text>;
+
+    private Task LinkRecruiter() => Act(async ct =>
+    {
+        if (await Contacts.LinkAsync(Id, _recruiter ?? "", null, ct) is not { } linked)
+            return ActionResult.Fail("не распознал контакт: нужен @username, t.me/…, e-mail или ссылка LinkedIn");
+        _recruiter = null;
+        if (linked.Kind == ContactKind.Telegram) _tgId = linked.ContactId;
+        return ActionResult.Done($"{linked.Value} привязан к компании вакансии");
+    });
+
+    private Task RemoveContact(long id) => Act(ct => _contactSnapshots.TryGetValue(id, out var snapshot)
+        ? Contacts.RemoveAsync(snapshot, ct)
+        : Task.FromResult(ActionResult.Fail("нет snapshot контакта; обновите страницу")), preserveContactsOnFailure: true);
+
+    private Task ReloadContacts() => LoadAsync(preserveLetter: true);
+
+    private Task FindPeople() => Act(ct => Outreach.FindPeopleAsync(Id, ct));
+
+    private Task SyncChat() => Act(ct => Chats.SyncVacancyAsync(Id, ct));
+
+    private Task DraftDm() => Act(async ct =>
+    {
+        if (Tg is not { } tg) return ActionResult.Fail("нет Telegram-контакта");
+        var (draft, error) = await Chats.DraftAsync(Id, tg.Id, _fresh, ct);
+        if (draft is null) return ActionResult.Fail(error ?? "черновик не получился");
+        (_dm, _lastDraft, _attach, _draftEvidence, _draftProblems) = (draft.Text, draft.Text, draft.AttachResume, draft.Evidence, draft.Problems);
+        return draft.Problems.Count > 0
+            ? ActionResult.Fail("черновик не прошёл проверку за три попытки: смотрите замечания под текстом")
+            : ActionResult.Done((draft.Fresh ? "черновик с чистого листа готов" : "черновик готов") + ": факты сверены с профилем, поправьте и отправьте");
+    });
+
+    /// <summary>The mode switch: an untouched draft is rewritten in the new mode, the user's own text is kept.</summary>
+    private async Task ToggleFresh(ChangeEventArgs e)
+    {
+        _fresh = e.Value is true;
+        if (_fresh) _attach = true;
+        if (string.IsNullOrWhiteSpace(_dm) || _dm == _lastDraft) await DraftDm();
+        else
+        {
+            _flash = "Текст ваш, не трогаю: нажмите «✨ Черновик», чтобы переписать в этом режиме";
+            _error = false;
+        }
+    }
+
+    private Task SendDm() => Act(async ct =>
+    {
+        if (Tg is not { } tg) return ActionResult.Fail("нет Telegram-контакта");
+        var result = await Chats.SendAsync(Id, tg.Id, _dm ?? "", _attach, ct, fresh: _fresh);
+        if (result.Ok) _dm = null;
+        return result;
+    });
+
+    private static string LegitimacyText(Legitimacy l) => l switch
+    {
+        Legitimacy.Ok => "ок",
+        Legitimacy.Suspicious => "сомнительная (без автоотклика)",
+        Legitimacy.Scam => "похоже на скам",
+        _ => "не оценена",
+    };
+
+    /// <summary>The responses and their conversations, newest first.</summary>
+    private RenderFragment History => @<text>
+        <div class="panel">
+            <b>История</b>
+            @foreach (var a in (_v?.Applications ?? []).OrderByDescending(a => a.CreatedAt))
+            {
+                <div style="margin-top:8px">
+                    @* The live application's state and stage are in the panel above; older attempts show how they ended. *@
+                    @if (a != Live)
+                    {
+                        <div class="small">
+                            <span class="badge @Ui.AppCss(a.Status)">@Ui.AppText(a.Status)</span> @WeeklyReportJob.ChannelLabel(a.Channel) · @Ui.ModeText(a.Mode) ·
+                            @Ui.Local(a.SentAt ?? a.CreatedAt) <span class="muted">@a.Error</span>
+                        </div>
+                    }
+                    @if (a.Events.Count(RecruiterChatService.IsTelegramMessage) is > 0 and var tgCount)
+                    {
+                        <div class="small muted" style="margin-top:4px">✈️ Переписка в Telegram (@tgCount) — в панели «Рекрутер в Telegram».</div>
+                    }
+                    <ul class="timeline">
+                        @foreach (var ev in a.Events.Where(x => !RecruiterChatService.IsTelegramMessage(x)).OrderByDescending(x => x.At))
+                        {
+                            <li class="small">
+                                <span class="muted">@Ui.Local(ev.At)</span> · @EventText(ev)
+                                @if (ev.Text is not null && ev.Kind != EventKind.StageChanged) { <div class="pre muted">@TextUtil.Truncate(ev.Text, 600)</div> }
+                                @if (ev.DraftStatus == DraftStatus.Pending) { <div>⏳ ждёт ответа, черновик: <span class="muted">@TextUtil.Truncate(ev.Draft, 300)</span></div> }
+                                else if (ev.DraftStatus == DraftStatus.Dismissed) { <div class="muted">без ответа</div> }
+                                else if (ev.DraftStatus == DraftStatus.Sending) { <div>⏳ отправляется; повторная отправка заблокирована</div> }
+                                else if (ev.DraftStatus == DraftStatus.OutcomeUnknown) { <div>⚠️ доставка требует ручной сверки; повторная отправка заблокирована</div> }
+                            </li>
+                        }
+                    </ul>
+                </div>
+            }
+        </div>
+    </text>;
+
+    /// <summary>The response that defines what can be done now: the newest one that is not failed or cancelled.</summary>
+    private Application? Live => _v?.Applications.Where(a => a.Status is not (ApplicationStatus.Failed or ApplicationStatus.Cancelled))
+        .OrderByDescending(a => a.CreatedAt).FirstOrDefault();
+
+    private static string EventText(ApplicationEvent ev) => ev.Kind switch
+    {
+        EventKind.StageChanged => $"стадия → {FunnelService.Label(ev.Stage)}" + (ev.Text is null ? "" : $" ({ev.Text})"),
+        EventKind.MessageIn => $"💬 {Ui.ChannelText(ev.Channel)}, {ev.Author}" + (Ui.ReplyText(ev.Classification) is { Length: > 0 } c ? $" · {c}" : ""),
+        EventKind.MessageOut => $"✉️ {ev.Author ?? "я"} → {Ui.ChannelText(ev.Channel)}",
+        EventKind.FollowUp => "⏰ напоминание",
+        _ => "📝 заметка",
+    };
+
+    private Task Apply() => Act(ct => Approvals.ApplyAsync(Id, ct));
+
+    private Task Manual() => Act(ct => Approvals.MarkManualAsync(Id, ct));
+
+    private Task Dismiss() => Act(ct => Approvals.DismissAsync(Id, ct));
+
+    private Task Rescore() => Act(ct => Approvals.RescoreAsync(Id, ct));
+
+    private Task SaveLetter() => Act(ct => Approvals.SetLetterAsync(Id, _letter ?? "", _letterSnapshot, ct), preserveLetterOnFailure: true);
+
+    private Task Regenerate() => Act(async ct => (await Approvals.RegenerateLetterAsync(Id, ct, _letterSnapshot)).Result, preserveLetterOnFailure: true);
+
+    private Task ReloadLetter()
+    {
+        _flash = null;
+        _error = false;
+        return LoadAsync();
+    }
+
+    private async Task Act(Func<CancellationToken, Task<ActionResult>> action, bool preserveLetterOnFailure = false, bool preserveContactsOnFailure = false)
+    {
+        _busy = true;
+        try
+        {
+            var result = await action(CancellationToken.None);
+            _flash = result.Message;
+            _error = !result.Ok;
+        }
+        catch (Exception e)
+        {
+            _flash = e.Message;
+            _error = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        if (preserveLetterOnFailure && _error) _letterConflict = true;
+        if (preserveContactsOnFailure && _error) return;
+        await LoadAsync(preserveLetterOnFailure && _error);
+    }
+}

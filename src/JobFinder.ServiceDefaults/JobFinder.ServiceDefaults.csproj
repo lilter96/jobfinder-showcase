@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- The .NET Aspire "service defaults" of this app: OpenTelemetry (traces, metrics, logs over OTLP to the Aspire dashboard), the
+         Prometheus scraping endpoint and health checks. The host and the CLI call AddServiceDefaults; the web host maps the endpoints. -->
+    <ItemGroup>
+        <FrameworkReference Include="Microsoft.AspNetCore.App"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.19.1"/>
+        <PackageReference Include="OpenTelemetry.Exporter.Prometheus.AspNetCore" Version="1.19.1-beta.1"/>
+        <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.19.1"/>
+        <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.19.0"/>
+        <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.19.0"/>
+        <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" Version="1.19.0"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\JobFinder.Core\JobFinder.Core.csproj"/>
+    </ItemGroup>
+
+</Project>

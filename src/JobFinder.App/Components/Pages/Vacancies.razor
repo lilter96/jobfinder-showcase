@@ -1,0 +1,197 @@
+@page "/vacancies"
+@inject IDbContextFactory<JobFinderDbContext> Db
+@inject NavigationManager Nav
+@inject JobFinder.Core.Options.SalaryOptions Salaries
+@inject JobFinder.Pipeline.Ingest.HhLinkQueue Links
+
+<PageTitle>JobFinder · Вакансии</PageTitle>
+<h1>Вакансии</h1>
+<Flash Message="@_flash"/>
+
+<div class="toolbar">
+    <input placeholder="Ссылки на вакансии hh / rabota.by: добавить в обычный поток" @bind="_links" style="flex:1;min-width:320px"/>
+    <button disabled="@string.IsNullOrWhiteSpace(_links)" @onclick="AddLinks">➕ Добавить</button>
+</div>
+
+<div class="toolbar">
+    <input placeholder="Поиск: название, компания" @bind="Search" @bind:event="oninput" @bind:after="Reload" style="min-width:240px"/>
+    <select @bind="Status" @bind:after="Reload">
+        <option value="">Все статусы</option>
+        @foreach (var s in Enum.GetValues<VacancyStatus>())
+        {
+            <option value="@s">@Ui.StatusText(s)</option>
+        }
+    </select>
+    <select @bind="DecisionFilter" @bind:after="Reload">
+        <option value="">Любое решение</option>
+        <option value="AutoApply">авто</option>
+        <option value="Approval">на одобрение</option>
+        <option value="Ignore">ниже порога</option>
+    </select>
+    <select @bind="Source" @bind:after="Reload">
+        <option value="">Все источники</option>
+        @foreach (var s in Enum.GetValues<SourceKind>())
+        {
+            <option value="@s">@s</option>
+        }
+    </select>
+    <label class="small">скор от <input type="number" min="0" max="100" style="width:64px" @bind="MinScore" @bind:after="Reload"/></label>
+    <span class="muted small">@_total найдено</span>
+</div>
+
+<div class="table-wrap">
+    <table>
+        <thead>
+        <tr>
+            <SortTh Key="score" Title="Скор" Class="num" DescFirst State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="title" Title="Вакансия" State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="city" Title="Где" State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="salary" Title="Зарплата" DescFirst State="_sort" StateChanged="SortBy"/>
+            <th>Источники</th>
+            <SortTh Key="status" Title="Статус" State="_sort" StateChanged="SortBy"/>
+            <SortTh Key="seen" Title="Найдена" DescFirst State="_sort" StateChanged="SortBy"/>
+        </tr>
+        </thead>
+        <tbody>
+        @foreach (var v in _items)
+        {
+            <tr>
+                <td class="num"><Score Value="v.Score"/></td>
+                <td>
+                    <a href="vacancies/@v.Id">@v.Title</a>
+                    <div class="small muted">@v.CompanyName</div>
+                </td>
+                <td class="small">@v.City<div class="muted">@Cards.Formats(v.WorkFormats)</div></td>
+                <td class="small">@Cards.Salary(v)</td>
+                <td class="small">@string.Join(", ", v.Sources.Select(s => s.Source).Distinct())</td>
+                <td>
+                    <span class="badge @Ui.StatusCss(v.Status)">@Ui.StatusText(v.Status)</span>
+                    <div class="small muted">@(v.Status switch
+                    {
+                        VacancyStatus.Rejected => TextUtil.Truncate(v.RejectReason, 60),
+                        VacancyStatus.Scored => Ui.DecisionText(v.Decision),
+                        _ => "",
+                    })</div>
+                </td>
+                <td class="small">@Ui.Local(v.FirstSeenAt)</td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</div>
+@if (_items.Count < _total)
+{
+    <p><button @onclick="More">Показать ещё</button></p>
+}
+
+@code {
+    private string? _links;
+    private string? _flash;
+
+    private async Task AddLinks()
+    {
+        var added = await Links.AddAsync(_links ?? "", CancellationToken.None);
+        _flash = added.Ids.Count == 0
+            ? "Не нашёл ссылок вида hh.ru/vacancy/123456"
+            : $"Принято: {string.Join(", ", added.Ids)}. " + (added.ViaAccount
+                ? "Читаю под вашим аккаунтом, дальше как обычно: фильтр, оценка, отклик или карточка. Итог придёт в бот."
+                : added.PausedUntil is { } until
+                    ? $"Через аккаунт сейчас нельзя, а анонимный доступ на паузе до {Ui.Local(until)}: прочитаю сразу после неё."
+                    : "Читаю страницы, дальше как обычно: фильтр, оценка, отклик или карточка. Итог придёт в бот.");
+        if (added.Ids.Count > 0) _links = null;
+    }
+
+    private const int PageSize = 50;
+    private List<Vacancy> _items = [];
+    private int _total;
+    private int _take = PageSize;
+    private static readonly SortState DefaultSort = new("seen", true);
+    private SortState _sort = DefaultSort;
+
+    [SupplyParameterFromQuery(Name = "status")] public string? Status { get; set; }
+    [SupplyParameterFromQuery(Name = "decision")] public string? DecisionFilter { get; set; }
+    [SupplyParameterFromQuery(Name = "source")] public string? Source { get; set; }
+    [SupplyParameterFromQuery(Name = "q")] public string? Search { get; set; }
+    [SupplyParameterFromQuery(Name = "min")] public int? MinScore { get; set; }
+    [SupplyParameterFromQuery(Name = "sort")] public string? Sort { get; set; }
+
+    protected override Task OnParametersSetAsync()
+    {
+        _sort = SortState.Parse(Sort, DefaultSort);
+        return LoadAsync();
+    }
+
+    private Task SortBy(SortState sort)
+    {
+        _sort = sort;
+        Sort = sort == DefaultSort ? null : sort.ToString();
+        return Reload();
+    }
+
+    private async Task Reload()
+    {
+        _take = PageSize;
+        Nav.NavigateTo(Nav.GetUriWithQueryParameters(new Dictionary<string, object?>
+        {
+            ["status"] = string.IsNullOrEmpty(Status) ? null : Status,
+            ["decision"] = string.IsNullOrEmpty(DecisionFilter) ? null : DecisionFilter,
+            ["source"] = string.IsNullOrEmpty(Source) ? null : Source,
+            ["q"] = string.IsNullOrWhiteSpace(Search) ? null : Search,
+            ["min"] = MinScore,
+            ["sort"] = Sort,
+        }), replace: true);
+        await LoadAsync();
+    }
+
+    private async Task More()
+    {
+        _take += PageSize;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        await using var ctx = await Db.CreateDbContextAsync();
+        IQueryable<Vacancy> q = ctx.Vacancies.AsNoTracking().Include(v => v.Sources);
+        if (Enum.TryParse<VacancyStatus>(Status, out var st)) q = q.Where(v => v.Status == st);
+        if (Enum.TryParse<Decision>(DecisionFilter, out var d)) q = q.Where(v => v.Decision == d && v.Status == VacancyStatus.Scored);
+        if (Enum.TryParse<SourceKind>(Source, out var src)) q = q.Where(v => v.Sources.Any(s => s.Source == src));
+        if (MinScore is { } min) q = q.Where(v => v.Score >= min);
+        if (!string.IsNullOrWhiteSpace(Search))
+        {
+            var pattern = $"%{Search.Trim()}%";
+            q = q.Where(v => EF.Functions.ILike(v.Title, pattern) || (v.CompanyName != null && EF.Functions.ILike(v.CompanyName, pattern)));
+        }
+
+        _total = await q.CountAsync();
+        _items = await Order(q).Take(_take).ToListAsync();
+    }
+
+    /// <summary>The chosen column, then the newest first; empty values (no score, no salary) always go last.</summary>
+    private IQueryable<Vacancy> Order(IQueryable<Vacancy> q)
+    {
+        var desc = _sort.Desc;
+        IOrderedQueryable<Vacancy> ordered = _sort.Key switch
+        {
+            "score" => desc ? q.OrderBy(v => v.Score == null).ThenByDescending(v => v.Score) : q.OrderBy(v => v.Score == null).ThenBy(v => v.Score),
+            "title" => desc ? q.OrderByDescending(v => v.Title) : q.OrderBy(v => v.Title),
+            "city" => desc ? q.OrderBy(v => v.City == null).ThenByDescending(v => v.City) : q.OrderBy(v => v.City == null).ThenBy(v => v.City),
+            "salary" => OrderBySalary(q, desc),
+            "status" => desc ? q.OrderByDescending(v => v.Status) : q.OrderBy(v => v.Status),
+            _ => desc ? q.OrderByDescending(v => v.FirstSeenAt) : q.OrderBy(v => v.FirstSeenAt),
+        };
+        return _sort.Key == "seen" ? ordered : ordered.ThenByDescending(v => v.FirstSeenAt);
+    }
+
+    /// <summary>By the upper bound in USD at the configured rates (gross and net side by side: the order, not the evaluation).</summary>
+    private IOrderedQueryable<Vacancy> OrderBySalary(IQueryable<Vacancy> q, bool desc)
+    {
+        decimal Rate(string currency) => Salaries.RatesToUsd.GetValueOrDefault(currency);
+        decimal eur = Rate("EUR"), rub = Rate("RUB"), byn = Rate("BYN"), kzt = Rate("KZT");
+        var known = q.OrderBy(v => (v.SalaryTo ?? v.SalaryFrom) == null
+            || (v.Currency != "USD" && v.Currency != "EUR" && v.Currency != "RUB" && v.Currency != "BYN" && v.Currency != "KZT"));
+        System.Linq.Expressions.Expression<Func<Vacancy, decimal?>> usd = v => (v.SalaryTo ?? v.SalaryFrom)
+            * (v.Currency == "USD" ? 1m : v.Currency == "EUR" ? eur : v.Currency == "RUB" ? rub : v.Currency == "BYN" ? byn : kzt);
+        return desc ? known.ThenByDescending(usd) : known.ThenBy(usd);
+    }
+}

@@ -1,0 +1,62 @@
+@inject JobFinder.Pipeline.Modules.Engagement.EngagementPolicyStore Store
+
+<div class="panel">
+    <b>Публикация в Threads</b> <span class="muted small">политика в БД · версия @(_snapshot?.Version)</span>
+    <Flash Message="@_message" Error="@_error" />
+    @if (_edited is { } policy)
+    {
+        <div class="kv" style="margin-top:12px; align-items:center">
+            <label for="engagement-auto" class="k">Без подтверждения</label><div><input id="engagement-auto" type="checkbox" @bind="policy.AutoPublish"/> <span class="muted small">выключено — новые комментарии ждут выбора в боте</span></div>
+            <label for="engagement-limit" class="k">Черновиков в день</label><div><input id="engagement-limit" type="number" min="0" max="100" @bind="policy.MaxDraftsPerDay"/></div>
+            <label for="engagement-cooldown" class="k">Пауза на автора, дней</label><div><input id="engagement-cooldown" type="number" min="0" max="365" @bind="policy.AuthorCooldownDays"/></div>
+        </div>
+        <div class="toolbar" style="margin-top:12px">
+            <button class="primary" disabled="@_busy" @onclick="SaveAsync">Сохранить публикацию Threads</button>
+            @if (_conflict) { <button disabled="@_busy" @onclick="ReloadAsync">Загрузить актуальную публикацию Threads</button> }
+        </div>
+    }
+</div>
+
+@code {
+    private JobFinder.Pipeline.Settings.PolicySnapshot<JobFinder.Core.Policies.EngagementPolicy>? _snapshot;
+    private JobFinder.Core.Policies.EngagementPolicy? _edited;
+    private string? _message;
+    private bool _error, _conflict, _busy;
+
+    protected override Task OnInitializedAsync() => ReloadAsync();
+
+    private async Task ReloadAsync()
+    {
+        _snapshot = await Store.ReadAsync(CancellationToken.None);
+        _edited = _snapshot.Value with { };
+        _conflict = false;
+        _error = false;
+        _message = null;
+    }
+
+    private async Task SaveAsync()
+    {
+        if (_snapshot is null || _edited is null || _busy) return;
+        _busy = true;
+        try
+        {
+            _snapshot = await Store.PublishAsync(_edited, _snapshot.Version, "dashboard", CancellationToken.None);
+            _edited = _snapshot.Value with { };
+            _conflict = false;
+            _error = false;
+            _message = "Публикация Threads сохранена: применяется к следующему проходу.";
+        }
+        catch (JobFinder.Pipeline.Settings.PolicyConflictException)
+        {
+            _conflict = true;
+            _error = true;
+            _message = "Политика уже изменилась. Ваши правки сохранены в форме; загрузите актуальную версию перед сохранением.";
+        }
+        catch (ArgumentException error)
+        {
+            _error = true;
+            _message = "Не сохранено: " + error.Message;
+        }
+        finally { _busy = false; }
+    }
+}

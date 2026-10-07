@@ -1,0 +1,10 @@
+# Prometheus for JobFinder (docker compose service "prometheus"): the app's OpenTelemetry metrics on /metrics.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: jobfinder
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8080"]
